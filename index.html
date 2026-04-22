@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>NEURO-MESH | SOC Dashboard</title>
+    <style>
+        body { background-color: #0a0e17; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; margin: 0; padding: 20px; }
+        .header { border-bottom: 2px solid #30363d; padding-bottom: 10px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .title { font-size: 24px; font-weight: bold; color: #58a6ff; text-shadow: 0 0 10px rgba(88, 166, 255, 0.5); }
+        .status-online { color: #3fb950; font-weight: bold; padding: 5px 10px; border: 1px solid #3fb950; border-radius: 4px; }
+        .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+        .panel { background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2 { color: #8b949e; font-size: 16px; margin-top: 0; border-bottom: 1px solid #30363d; padding-bottom: 5px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-size: 12px; letter-spacing: 1px; }
+        .log-list { list-style-type: none; padding: 0; margin: 0; font-size: 13px; max-height: 400px; overflow-y: auto; }
+        .log-list li { margin-bottom: 5px; padding: 8px; border-left: 3px solid #58a6ff; background: #0d1117; }
+        .log-alert { border-left-color: #f85149 !important; color: #f85149; font-weight: bold; }
+        .status-STABLE { color: #3fb950; font-weight: bold; }
+        .status-COMPROMIS { color: #f85149; font-weight: bold; animation: blink 1s infinite; }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title" id="arch-title">NEURO-MESH SYSTEM</div>
+        <div>STATE: <span class="status-online" id="sys-status">WAITING...</span></div>
+    </div>
+    <div class="grid">
+        <div class="panel">
+            <h2>📡 ACTIVE NEURONS MONITORING</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>HOSTNAME</th>
+                        <th>IP</th>
+                        <th>RAM (MB)</th>
+                        <th>PROCS</th>
+                        <th>LATENCY</th>
+                        <th>STATUS</th>
+                    </tr>
+                </thead>
+                <tbody id="nodes-body">
+                    </tbody>
+            </table>
+        </div>
+        <div class="panel">
+            <h2>⚠️ REAL-TIME THREAT LOGS</h2>
+            <ul class="log-list" id="logs-list">
+                </ul>
+        </div>
+    </div>
+
+    <script>
+        async function fetchAPI() {
+            try {
+                // Le "?t=" empêche le navigateur de garder l'ancien fichier en cache
+                const response = await fetch('api.json?t=' + new Date().getTime());
+                const data = await response.json();
+                
+                document.getElementById('arch-title').innerText = data.architecture;
+                document.getElementById('sys-status').innerText = data.system_status;
+
+                // Mise à jour du Tableau des Agents
+                const tbody = document.getElementById('nodes-body');
+                tbody.innerHTML = '';
+                data.active_nodes.forEach(node => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td><strong>${node.id}</strong></td>
+                        <td>${node.hostname}</td>
+                        <td>${node.ip}</td>
+                        <td style="color:#d2a8ff;">${node.ram_mb}</td>
+                        <td style="color:#f2cc60;">${node.procs}</td>
+                        <td>${node.latency}ms</td>
+                        <td class="status-${node.status}">${node.status}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+
+                // Mise à jour des Logs de Sécurité
+                const logList = document.getElementById('logs-list');
+                logList.innerHTML = '';
+                data.logs.slice().reverse().forEach(log => {
+                    const li = document.createElement('li');
+                    li.innerText = log;
+                    // Mettre en rouge si c'est une alerte
+                    if (log.includes("ANOMALIE") || log.includes("INTRUSION") || log.includes("ALERTE")) {
+                        li.className = "log-alert";
+                    }
+                    logList.appendChild(li);
+                });
+
+            } catch (error) {
+                console.error("En attente des données du Cerveau...");
+            }
+        }
+
+        // Le Dashboard se met à jour chaque seconde !
+        setInterval(fetchAPI, 1000);
+        fetchAPI(); 
+    </script>
+</body>
+</html>
