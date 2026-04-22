@@ -1,0 +1,12 @@
+# Ignorer les exécutables compilés
+client
+listener
+sentry
+
+# Ignorer les fichiers de données dynamiques (facultatif)
+# api.json
+
+# Ignorer les fichiers temporaires ou de backup
+*.o
+*.swp
+*~
