@@ -1,38 +1,70 @@
-# ⚙️ NEURO-MESH FORGE : VERSION ABSOLUTE SUPREME (PHASE 2 COMPLÈTE)
-# Variables : On définit nos outils
+# ============================================================
+# NEURO-MESH FORGE : ULTIME EDITION (GCM + cross-platform)
+# ============================================================
+# Auteur : El Yazid
+# Description : Compilation de l'écosystème complet NEURO-MESH
+# ============================================================
+
 CXX = g++
+CXXFLAGS = -Wall -std=c++17 -O3 -s -fno-ident
+LDFLAGS = -pthread -lssl -lcrypto -lcurl
 
-# 🛡️ FLAGS D'ÉLITE (Polymorphisme et Silence) :
-# -O3 : Optimisation maximale (réorganise le flux pour perturber la lecture)
-# -s : STRIP (Détruit les tables de symboles, rendant 'strings' aveugle)
-# -fno-ident : Efface la signature de ton compilateur GCC
-# -DSEED=$(shell date +%s) : Change le hash du binaire à chaque seconde
-CXXFLAGS = -Wall -std=c++17 -O3 -s -fno-ident -DSEED=$(shell date +%s)
-LDFLAGS = -lpthread -lcrypto
+TARGETS = listener client packer
 
-# Cibles : L'écosystème complet
-TARGETS = client listener packer
+all: banner $(TARGETS) size_report
 
-all: $(TARGETS)
+banner:
+	@echo ""
+	@echo -e "\033[0;36m========================================\033[0m"
+	@echo -e "\033[0;36m🧬 NEURO-MESH : COMPILATION ULTIME\033[0m"
+	@echo -e "\033[0;36m========================================\033[0m"
+	@echo -e "\033[1;33m📦 CXXFLAGS : $(CXXFLAGS)\033[0m"
+	@echo -e "\033[1;33m🔗 LDFLAGS  : $(LDFLAGS)\033[0m"
+	@echo -e "\033[0;36m========================================\033[0m"
+	@echo ""
 
-# Construction de l'Agent (Le Fantôme)
-client: client.cpp
-	$(CXX) $(CXXFLAGS) client.cpp -o client $(LDFLAGS)
-	@echo "🛡️ Agent Sentinel généré et durci."
-
-# Construction du Cerveau (Le C2)
 listener: listener.cpp
+	@echo -e "\033[1;33m🧠 Compilation du C2 (listener)...\033[0m"
 	$(CXX) $(CXXFLAGS) listener.cpp -o listener $(LDFLAGS)
-	@echo "🧠 Cerveau C2 généré."
+	@echo -e "\033[0;32m✅ C2 généré\033[0m"
 
-# Construction de l'Enveloppe (L'Armure)
+client: client.cpp
+	@echo -e "\033[1;33m🛡️ Compilation de l'agent...\033[0m"
+	$(CXX) $(CXXFLAGS) client.cpp -o client $(LDFLAGS)
+	@echo -e "\033[0;32m✅ Agent généré\033[0m"
+
 packer: packer.cpp
+	@echo -e "\033[1;33m📦 Compilation du packer...\033[0m"
 	$(CXX) $(CXXFLAGS) packer.cpp -o packer $(LDFLAGS)
-	@echo "📦 Packer généré."
+	@echo -e "\033[0;32m✅ Packer généré\033[0m"
 
-# Nettoyage chirurgical
+size_report:
+	@echo ""
+	@echo -e "\033[0;36m========================================\033[0m"
+	@echo -e "\033[0;36m📊 TAILLE DES BINAIRES\033[0m"
+	@echo -e "\033[0;36m========================================\033[0m"
+	@for bin in $(TARGETS); do \
+		if [ -f $$bin ]; then \
+			SIZE=$$(ls -lh $$bin | awk '{print $$5}'); \
+			echo -e "\033[0;32m✅ $$bin : $$SIZE\033[0m"; \
+		else \
+			echo -e "\033[0;31m❌ $$bin : non trouvé\033[0m"; \
+		fi \
+	done
+	@echo -e "\033[0;36m========================================\033[0m"
+	@echo ""
+
 clean:
-	rm -f $(TARGETS)
+	@echo -e "\033[1;33m🧹 Nettoyage des binaires et fichiers temporaires...\033[0m"
+	rm -f $(TARGETS) api.json api_tmp.json ia_commands.txt incident_report.txt *.log
+	@echo -e "\033[0;32m✅ Nettoyage effectué\033[0m"
 
-# Réinitialisation totale de la forge
+distclean: clean
+	@echo -e "\033[1;33m🧹 Nettoyage complet (y compris modèles IA)...\033[0m"
+	rm -f *.o *.so core core.*
+	rm -rf trained_models/
+	@echo -e "\033[0;32m✅ Nettoyage complet terminé\033[0m"
+
 rebuild: clean all
+
+.PHONY: all clean distclean rebuild
