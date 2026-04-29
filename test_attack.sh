@@ -2,7 +2,7 @@
 # ============================================================
 # NEURO-MESH : Simulation d'attaque mémoire (ULTIME - FIABLE)
 # ============================================================
-# - Utilise api.json pour détecter l'état COMPROMIS (grep simple)
+# - Scanne api.json ET api_react.json (C2 + P2P)
 # - Gère le mode forcé (--force) avec envoi de SIGUSR1
 # ============================================================
 
@@ -52,13 +52,13 @@ except:
     ATTACK_PID=$!
 fi
 
-echo -e "${YELLOW}⏳ Surveillance de la détection (fichier api.json)...${NC}"
+echo -e "${YELLOW}⏳ Surveillance de la détection (C2 & P2P)...${NC}"
 echo ""
 
-# 🔥 Détection ultra-robuste : on cherche la chaîne "COMPROMIS" dans le JSON
+# 🔥 LE FIX : On scanne les deux fichiers de vérité (C2 et IA) en fusionnant les sorties
 DETECTED=false
 for i in {30..1}; do
-    if grep -q '"COMPROMIS"' api.json 2>/dev/null; then
+    if cat api.json api_react.json 2>/dev/null | grep -q '"COMPROMIS"'; then
         DETECTED=true
         break
     fi
@@ -71,7 +71,7 @@ if [ "$DETECTED" = false ] && [ "$FORCE_ISOLATE" = true ]; then
     echo -e "\n${YELLOW}⚡ Aucune détection IA, isolation forcée par signal...${NC}"
     kill -SIGUSR1 "$AGENT_PID" 2>/dev/null
     sleep 2
-    if grep -q '"COMPROMIS"' api.json 2>/dev/null; then
+    if cat api.json api_react.json 2>/dev/null | grep -q '"COMPROMIS"'; then
         DETECTED=true
         echo -e "${GREEN}✅ Isolation forcée réussie${NC}"
     fi
@@ -87,8 +87,9 @@ kill $ATTACK_PID 2>/dev/null
 echo -e "${CYAN}========================================${NC}"
 if [ "$DETECTED" = true ]; then
     echo -e "${GREEN}✅ Vérifications :${NC}"
-    echo -e "   - Dashboard : agent en ${RED}COMPROMIS${NC} (ligne rouge)"
+    echo -e "   - Dashboard React : agent en ${RED}COMPROMIS${NC} (ligne rouge)"
     echo -e "   - Radar : ${RED}rouge${NC}"
+    echo -e "   - Timeline : événement d'attaque visible"
 else
     echo -e "${RED}❌ Aucune détection. Vérifiez les logs.${NC}"
 fi

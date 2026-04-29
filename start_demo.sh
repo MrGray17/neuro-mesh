@@ -1,87 +1,119 @@
 #!/bin/bash
+
 # ============================================================
-# NEURO-MESH : Lancement complet de la démo (ULTIME)
-# ============================================================
-# - Nettoie les processus résiduels
-# - Supprime les modèles IA (trained_models) pour repartir de zéro
-# - Compile avec make
-# - Lance C2, IA, dashboard, 3 agents
+# NEURO-MESH : DEPLOYMENT SCRIPT (ULTIMATE EDITION)
+# PBFT + Edge AI + React Dashboard + CORS Bypass
 # ============================================================
 
-set -e
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+# Couleurs pour l'affichage terminal
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+CYAN='\033[1;36m'
 YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
+MAGENTA='\033[1;35m'
 NC='\033[0m'
 
-echo -e "${CYAN}========================================${NC}"
-echo -e "${CYAN}🧬 NEURO-MESH : Lancement de la démo (Ultime)${NC}"
-echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}==============================================${NC}"
+echo -e "${CYAN}      INITIALISATION DE NEURO-MESH V3.0       ${NC}"
+echo -e "${CYAN}==============================================${NC}"
 
-# Nettoyage complet (processus + fichiers + modèles IA)
-echo -e "${YELLOW}[1/6] Nettoyage des anciens processus, fichiers et modèles...${NC}"
-pkill -f listener 2>/dev/null || true
-pkill -f client 2>/dev/null || true
-pkill -f brain_ia.py 2>/dev/null || true
-pkill -f "python3 -m http.server" 2>/dev/null || true
-rm -f api.json api_tmp.json ia_commands.txt incident_report.txt
-# 🔥 Nettoyage des modèles IA persistants (pour repartir de zéro)
-rm -rf trained_models/*.joblib 2>/dev/null || true
+# 1. Nettoyage de la zone de combat
+echo -e "\n${YELLOW}[*] Purge des anciens processus...${NC}"
+killall listener client python3 node 2>/dev/null
+rm -f api.json ia_commands.txt incident_report.txt
 sleep 1
+echo -e "${GREEN}[+] Zone sécurisée.${NC}"
 
-# Compilation
-echo -e "${YELLOW}[2/6] Compilation du C2 et de l'agent...${NC}"
-make clean > /dev/null 2>&1
-if ! make > /dev/null 2>&1; then
-    echo -e "${RED}❌ Erreur de compilation${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✅ Compilation réussie${NC}"
-
-# Lancement du C2
-echo -e "${YELLOW}[3/6] Lancement du C2 (listener) sur le port 8080...${NC}"
-./listener &
-LISTENER_PID=$!
-sleep 2
-if kill -0 $LISTENER_PID 2>/dev/null; then
-    echo -e "${GREEN}✅ C2 lancé (PID: $LISTENER_PID)${NC}"
+# 2. Lancement du C2 Supreme (Moelle Épinière)
+echo -e "\n${YELLOW}[*] Démarrage du C2 Supreme...${NC}"
+if [ -f "./listener" ]; then
+    ./listener > /dev/null 2>&1 &
+    sleep 2
+    echo -e "${GREEN}[+] C2 en ligne (Port 8080 et WS 8081).${NC}"
 else
-    echo -e "${RED}❌ Le C2 n'a pas démarré${NC}"
+    echo -e "${RED}[!] ERREUR : Exécutable 'listener' introuvable. As-tu fait un 'make' ?${NC}"
     exit 1
 fi
 
-# Lancement de l'IA
-echo -e "${YELLOW}[4/6] Lancement du Cortex IA (Isolation Forest)...${NC}"
-python3 brain_ia.py &
-IA_PID=$!
-sleep 1
-echo -e "${GREEN}✅ IA lancée (PID: $IA_PID)${NC}"
-
-# Lancement du serveur Web (dashboard)
-echo -e "${YELLOW}[5/6] Lancement du serveur Web (dashboard) sur le port 8000...${NC}"
-python3 -m http.server 8000 > /dev/null 2>&1 &
-HTTP_PID=$!
-sleep 1
-echo -e "${GREEN}✅ Dashboard disponible sur http://localhost:8000${NC}"
-
-# Lancement de 3 agents
-echo -e "${YELLOW}[6/6] Lancement de 3 agents...${NC}"
-for i in 1 2 3; do
-    ./client &
-    echo -e "${GREEN}   Agent $i lancé${NC}"
+# 3. Lancement du Cortex IA Central (optionnel selon ton archi, mais sécurisé)
+echo -e "\n${YELLOW}[*] Activation du Cortex IA (brain_ia.py)...${NC}"
+if [ -f "brain_ia.py" ]; then
+    python3 brain_ia.py > /dev/null 2>&1 &
     sleep 1
-done
+    echo -e "${GREEN}[+] IA Centrale connectée.${NC}"
+else
+    echo -e "${YELLOW}[-] Fichier 'brain_ia.py' absent, les agents fonctionneront en Edge AI autonome.${NC}"
+fi
 
-echo ""
-echo -e "${CYAN}========================================${NC}"
-echo -e "${GREEN}✅ TOUT EST OPÉRATIONNEL${NC}"
-echo -e "${CYAN}========================================${NC}"
-echo -e "📡 Dashboard : ${CYAN}http://localhost:8000${NC}"
-echo -e "🧠 IA Cortex : ${CYAN}active (modèles réinitialisés)${NC}"
-echo -e "🛡️ Honeypot : ${CYAN}port 2222 ou suivant${NC}"
-echo -e "🔌 WebSocket : ${CYAN}ws://localhost:8081${NC}"
-echo -e "⚔️ Pour simuler une attaque : ${CYAN}./test_attack.sh${NC}"
-echo -e "🛑 Pour tout arrêter : ${CYAN}pkill -f listener; pkill -f client; pkill -f python3${NC}"
-echo -e "${CYAN}========================================${NC}"
+# 4. Déploiement des Agents PBFT
+echo -e "\n${YELLOW}[*] Déploiement de la flotte d'agents (Architecture P2P)...${NC}"
+if [ -f "./client" ]; then
+    for i in 1 2 3
+    do
+        ./client > /dev/null 2>&1 &
+        echo -e "${MAGENTA}  -> Déploiement de l'Agent $i...${NC}"
+        sleep 1
+    done
+    echo -e "${GREEN}[+] Maillage P2P et Consensus PBFT actifs.${NC}"
+else
+    echo -e "${RED}[!] ERREUR : Exécutable 'client' introuvable.${NC}"
+    exit 1
+fi
+
+# 5. Déploiement du pont HTTP et de l'interface React
+echo -e "\n${YELLOW}[*] Déploiement des interfaces de monitoring...${NC}"
+echo -e "${CYAN}  -> Configuration du pont HTTP CORS (Port 8000)...${NC}"
+
+# 🔥 LE SERVEUR PYTHON AVEC CONTOURNEMENT CORS
+python3 -c "
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+class CORSRequestHandler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        super().end_headers()
+HTTPServer(('0.0.0.0', 8000), CORSRequestHandler).serve_forever()
+" > /dev/null 2>&1 &
+
+sleep 1
+echo -e "${GREEN}[+] Pont HTTP actif.${NC}"
+
+# Lancement de React
+DASHBOARD_DIR="dashboard-react"
+if [ -d "$DASHBOARD_DIR" ]; then
+    echo -e "${CYAN}  -> Lancement du Dashboard React (Port 3000)...${NC}"
+    cd "$DASHBOARD_DIR"
+    
+    # Vérifie si npm install a été fait
+    if [ ! -d "node_modules" ]; then
+        echo -e "${YELLOW}  -> Installation des dépendances (patientez un instant)...${NC}"
+        npm install --silent
+    fi
+    
+    npm start > /dev/null 2>&1 &
+    cd ..
+    echo -e "${GREEN}[+] Node.js lancé en arrière-plan.${NC}"
+else
+    echo -e "${YELLOW}[-] Dashboard React non trouvé. Interface statique de secours disponible.${NC}"
+fi
+
+# ============================================================
+# OUTRO & INSTRUCTIONS
+# ============================================================
+echo -e "\n${GREEN}==============================================${NC}"
+echo -e "${GREEN}  🚀 DÉPLOIEMENT TERMINÉ AVEC SUCCÈS !  🚀${NC}"
+echo -e "${GREEN}==============================================${NC}"
+echo -e ""
+echo -e "🔗 ${CYAN}C2 WebSocket${NC}  : ws://localhost:8081/?token=NEURO_MESH_SECRET"
+echo -e "🔗 ${CYAN}API JSON${NC}      : http://localhost:8000/api.json"
+if [ -d "$DASHBOARD_DIR" ]; then
+    echo -e "🔗 ${MAGENTA}DASHBOARD REACT${NC} : http://localhost:3000"
+else
+    echo -e "🔗 ${MAGENTA}DASHBOARD WEB${NC}   : http://localhost:8000"
+fi
+echo -e ""
+echo -e "${YELLOW}Pour lancer une attaque et tester le consensus PBFT :${NC}"
+echo -e "👉 Exécute : ./test_attack.sh"
+echo -e ""
+echo -e "${YELLOW}Pour tout éteindre :${NC}"
+echo -e "👉 Exécute : killall listener client python3 node"
+echo -e ""

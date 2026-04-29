@@ -47,6 +47,7 @@
         body.battlefield .p-logs { grid-column: 3 !important; }
         body.battlefield .p-radar { grid-column: 1 !important; }
         body.battlefield .force-graph { height: 160px !important; }
+        body.battlefield .event-timeline { display: none !important; }
         .header {
             display: flex; justify-content: space-between; align-items: center;
             border-bottom: 1px solid var(--border-color); padding-bottom: 10px; margin-bottom: 10px;
@@ -65,6 +66,59 @@
             transition: 0.2s;
         }
         .btn:hover { border-color: var(--neon-blue); color: var(--neon-blue); box-shadow: 0 0 8px rgba(0,229,255,0.3); }
+        /* Bouton attaque flamboyant */
+        #attackBtn {
+            background: linear-gradient(45deg, #ff003c, #ff6600);
+            border: none;
+            color: white;
+            font-weight: bold;
+            text-shadow: 0 0 5px rgba(0,0,0,0.5);
+            transition: all 0.3s ease;
+            animation: pulse-attack 2s infinite;
+        }
+        #attackBtn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(255,0,60,0.8);
+            cursor: pointer;
+        }
+        @keyframes pulse-attack {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; box-shadow: 0 0 10px #ff003c; }
+        }
+        /* Sonar ping */
+        @keyframes sonar-ping {
+            0% { box-shadow: 0 0 0 0 rgba(255,0,60,0.7); }
+            70% { box-shadow: 0 0 0 20px rgba(255,0,60,0); }
+            100% { box-shadow: 0 0 0 0 rgba(255,0,60,0); }
+        }
+        .sonar-active {
+            animation: sonar-ping 1s ease-out;
+        }
+        /* Timeline */
+        .event-timeline {
+            height: 100%;
+            overflow-y: auto;
+            font-size: 10px;
+            background: #05050a;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        .event-entry {
+            border-left: 3px solid var(--neon-blue);
+            padding: 4px 6px;
+            margin-bottom: 4px;
+            font-family: monospace;
+            background: rgba(0,229,255,0.05);
+        }
+        .event-attack {
+            border-left-color: var(--neon-red);
+            background: rgba(255,0,60,0.15);
+            animation: blink-row 0.5s 3;
+        }
+        @keyframes blink-row {
+            0%, 100% { background: rgba(255,0,60,0.15); }
+            50% { background: rgba(255,0,60,0.4); }
+        }
         .siem-grid {
             display: grid;
             grid-template-columns: 1fr 2.5fr 1.2fr;
@@ -90,6 +144,7 @@
         .p-cpu { grid-column: 3; grid-row: 1; }
         .p-graph { grid-column: 3; grid-row: 2; }
         .p-logs { grid-column: 3; grid-row: 3; }
+        .p-events { grid-column: 1; grid-row: 2; } /* on va l'ajouter dans la grille */
         .radar-container {
             flex-grow: 1; display: flex; justify-content: center; align-items: center;
             background: radial-gradient(circle, #0a0a12 0%, #000 100%); min-height: 150px;
@@ -152,6 +207,7 @@
     <div class="button-group">
         <button class="btn" id="exportPdfBtn">📄 EXPORT PDF</button>
         <button class="btn" id="battlefieldBtn">⚔️ BATTLEFIELD</button>
+        <button class="btn" id="attackBtn">💣 TRIGGER ATTACK</button>
     </div>
     <div class="sys-metrics">
         <div class="metric-box"><div style="font-size:9px">AGENTS</div><div class="metric-val" id="count-val">0</div></div>
@@ -166,9 +222,12 @@
         <div class="panel-header">📡 NETWORK RADAR</div>
         <div class="radar-container"><div class="radar" id="radar-core"><div class="radar-threat" id="radar-threat"></div></div></div>
     </div>
-    <div class="panel p-threat">
-        <div class="panel-header">⚠️ THREAT DISTRIBUTION</div>
-        <div class="chart-container"><canvas id="statusChart"></canvas></div>
+    <!-- Panel "EVENT TIMELINE" ajouté à la place de l'ancien p-threat (mais on garde threat plus bas) -->
+    <div class="panel p-events" style="grid-column: 1; grid-row: 2;">
+        <div class="panel-header">📅 EVENT TIMELINE</div>
+        <div class="event-timeline" id="eventTimeline">
+            <div class="event-entry">🟢 Système initialisé</div>
+        </div>
     </div>
     <div class="panel p-ram">
         <div class="panel-header">📈 AVG RAM (MB)</div>
@@ -208,6 +267,9 @@
     let autoScroll = true;
     let timeLabels = [], ramData = [], cpuData = [];
 
+    // État précédent des nœuds pour détecter les nouvelles compromissions
+    let previousNodes = [];
+
     Chart.defaults.color = '#565f89';
     Chart.defaults.font.family = 'Courier New';
     const ramChart = new Chart(document.getElementById('ramChart'), {
@@ -237,12 +299,44 @@
         while(logContainer.children.length > 200) logContainer.removeChild(logContainer.firstChild);
     }
 
+    // Gestion de la timeline des événements
+    const timelineContainer = document.getElementById('eventTimeline');
+    function addEvent(message, type = 'info') {
+        const entry = document.createElement('div');
+        entry.className = 'event-entry';
+        if (type === 'attack') entry.classList.add('event-attack');
+        const time = new Date().toLocaleTimeString();
+        entry.innerHTML = `[${time}] ${message}`;
+        timelineContainer.appendChild(entry);
+        entry.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        while (timelineContainer.children.length > 50) timelineContainer.removeChild(timelineContainer.firstChild);
+    }
+
+    function playSonar() {
+        const radar = document.getElementById('radar-core');
+        radar.classList.add('sonar-active');
+        setTimeout(() => radar.classList.remove('sonar-active'), 1000);
+    }
+
     function updateLastUpdate() { document.getElementById('last-update').innerText = new Date().toLocaleTimeString('fr-FR'); }
 
     function updateDashboard(data) {
         const nodes = data.active_nodes || [];
         const logs = data.logs || [];
         document.getElementById('count-val').innerText = nodes.length;
+
+        // Détecter les nouvelles compromissions
+        const oldCompromised = previousNodes.filter(n => n.status === 'COMPROMIS').map(n => n.id);
+        const newCompromised = nodes.filter(n => n.status === 'COMPROMIS').map(n => n.id);
+        for (let id of newCompromised) {
+            if (!oldCompromised.includes(id)) {
+                const node = nodes.find(n => n.id === id);
+                addEvent(`⚠️ ALERTE: Agent ${id} (${node?.hostname}) est maintenant COMPROMIS`, 'attack');
+                playSonar();
+            }
+        }
+        previousNodes = JSON.parse(JSON.stringify(nodes));
+
         let stable=0, comp=0, totalRam=0, totalCpuNorm=0;
         const tbody = document.getElementById('nodes-body');
         tbody.innerHTML = '';
@@ -334,25 +428,42 @@
         updateLastUpdate();
     }
 
+    // WebSocket avec token
     function initWebSocket() {
         const wsStatus = document.getElementById('ws-status');
-        // 🔥 LIGNE CORRIGÉE : AJOUT DU TOKEN D'AUTHENTIFICATION
         ws = new WebSocket('ws://' + window.location.hostname + ':8081/?token=NEURO_MESH_SECRET');
-        
-        ws.onopen = () => { wsStatus.innerText = 'LIVE'; wsStatus.className = 'metric-val ws-status live'; addLog('WebSocket connecté au C2', 'resilience'); };
+        ws.onopen = () => { wsStatus.innerText = 'LIVE'; wsStatus.className = 'metric-val ws-status live'; addLog('WebSocket connecté au C2', 'resilience'); addEvent('WebSocket connecté au serveur C2'); };
         ws.onmessage = (e) => { try { updateDashboard(JSON.parse(e.data)); } catch(err) {} };
         ws.onerror = () => { wsStatus.innerText = 'ERR'; wsStatus.className = 'metric-val ws-status offline'; };
         ws.onclose = () => { wsStatus.innerText = 'OFF'; wsStatus.className = 'metric-val ws-status offline'; setTimeout(initWebSocket, 3000); };
     }
     initWebSocket();
 
-    // Fallback polling
+    // Fallback polling (si WebSocket indisponible)
     setTimeout(() => {
         if(!ws || ws.readyState !== WebSocket.OPEN) {
             addLog('WebSocket indisponible, fallback polling toutes les 2s', 'alert');
+            addEvent('⚠️ WebSocket indisponible, passage au mode polling', 'attack');
             setInterval(() => { fetch('api.json?t='+Date.now()).then(r=>r.json()).then(updateDashboard).catch(()=>{}); }, 2000);
         }
     }, 3000);
+
+    // Bouton d'attaque via API Flask
+    document.getElementById('attackBtn').onclick = async () => {
+        addEvent('🔥 Attaque manuelle déclenchée', 'attack');
+        playSonar();
+        try {
+            const response = await fetch('/api/attack', { method: 'POST' });
+            const data = await response.json();
+            addEvent(`📡 ${data.message || 'Attaque simulée envoyée'}`, 'attack');
+            addLog(`[MANUAL] Attaque déclenchée via dashboard`, 'alert');
+        } catch(e) {
+            addEvent('❌ Échec du déclenchement de l\'attaque (API Flask?)', 'attack');
+            addLog(`[ERROR] Impossible de contacter l'API Flask: ${e}`, 'alert');
+            // Fallback: lancer le script local si Flask n'est pas actif
+            fetch('/api/attack').catch(() => {});
+        }
+    };
 
     document.getElementById('exportPdfBtn').onclick = () => { html2pdf().set({ margin: 0.5, filename: 'neuro_mesh_report.pdf', image: { type: 'jpeg', quality: 0.98 }, jsPDF: { unit: 'in', format: 'a2', orientation: 'landscape' } }).from(document.body).save(); addLog('Export PDF généré', 'resilience'); };
     document.getElementById('battlefieldBtn').onclick = () => { battlefieldActive = !battlefieldActive; document.body.classList.toggle('battlefield', battlefieldActive); document.getElementById('battlefieldBtn').innerHTML = battlefieldActive ? '🔄 EXIT' : '⚔️ BATTLEFIELD'; addLog(battlefieldActive ? 'Mode Battlefield activé' : 'Mode normal', 'resilience'); };

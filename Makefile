@@ -38,6 +38,18 @@ packer: packer.cpp
 	$(CXX) $(CXXFLAGS) packer.cpp -o packer $(LDFLAGS)
 	@echo -e "\033[0;32m✅ Packer généré\033[0m"
 
+dashboard-install:
+	@echo -e "\033[1;33m📦 Installation dépendances dashboard React...\033[0m"
+	cd dashboard-react && npm install
+
+dashboard-build:
+	@echo -e "\033[1;33m⚛️  Build dashboard React (version production)...\033[0m"
+	cd dashboard-react && npm run build
+
+dashboard-start:
+	@echo -e "\033[1;33m🚀 Lancement dashboard React (dev)...\033[0m"
+	cd dashboard-react && npm start &
+
 size_report:
 	@echo ""
 	@echo -e "\033[0;36m========================================\033[0m"
@@ -56,7 +68,7 @@ size_report:
 
 clean:
 	@echo -e "\033[1;33m🧹 Nettoyage des binaires et fichiers temporaires...\033[0m"
-	rm -f $(TARGETS) api.json api_tmp.json ia_commands.txt incident_report.txt *.log
+	rm -f $(TARGETS) api.json api_tmp.json api_react.json react_temp.json ia_commands.txt incident_report.txt *.log
 	@echo -e "\033[0;32m✅ Nettoyage effectué\033[0m"
 
 distclean: clean
@@ -67,4 +79,4 @@ distclean: clean
 
 rebuild: clean all
 
-.PHONY: all clean distclean rebuild
+.PHONY: all clean distclean rebuild dashboard-install dashboard-build dashboard-start

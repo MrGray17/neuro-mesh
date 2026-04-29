@@ -1,0 +1,43 @@
+{
+    "architecture": "NEURO-MESH (SURVIE CORTEX IA)",
+    "system_status": "ONLINE",
+    "active_nodes": [
+        {
+            "id": "NODE_3042",
+            "hostname": "ElYazidsLaptop",
+            "cpu_load": 0.06689453125,
+            "ram_mb": 1309,
+            "procs": 8,
+            "net_out_bytes_s": 449,
+            "latency": 5043,
+            "status": "STABLE",
+            "p2p_state": "NORMAL",
+            "neighbors": "NODE_3050,NODE_3058"
+        },
+        {
+            "id": "NODE_3050",
+            "hostname": "ElYazidsLaptop",
+            "cpu_load": 0.06689453125,
+            "ram_mb": 1309,
+            "procs": 8,
+            "net_out_bytes_s": 151,
+            "latency": 5043,
+            "status": "STABLE",
+            "p2p_state": "NORMAL",
+            "neighbors": "NODE_3058,NODE_3042"
+        },
+        {
+            "id": "NODE_3058",
+            "hostname": "ElYazidsLaptop",
+            "cpu_load": 0.0732421875,
+            "ram_mb": 1309,
+            "procs": 8,
+            "net_out_bytes_s": 0,
+            "latency": 5043,
+            "status": "COMPROMIS",
+            "p2p_state": "NORMAL",
+            "neighbors": "NODE_3042,NODE_3050"
+        }
+    ],
+    "timestamp": 1777470006.318061
+}

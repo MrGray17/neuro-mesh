@@ -1,6 +1,7 @@
 // ============================================================
-// NEURO-MESH AGENT : ULTIMATE FINAL EDITION (TCP SYNC FIXED)
+// NEURO-MESH AGENT : ULTIMATE PERFECT EDITION (TRUE P2P SONAR)
 // ============================================================
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -10,6 +11,7 @@
     #define CLOSE_SOCKET closesocket
     #define SLEEP_MS(x) Sleep(x)
     #define GET_PID _getpid
+    #define SHUT_RDWR SD_BOTH
 #else
     #include <sys/socket.h>
     #include <arpa/inet.h>
@@ -21,6 +23,7 @@
     #include <ifaddrs.h>
     #include <signal.h>
     #include <poll.h>
+    #include <netdb.h>
     #define CLOSE_SOCKET close
     #define SLEEP_MS(x) usleep((x) * 1000)
     #define GET_PID getpid
@@ -41,11 +44,21 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <deque>
+#include <numeric>
+#include <cmath>
+#include <map>
+#include <set>
+#include <list>
+#include <memory>
+#include <stdexcept>
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
-#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <openssl/ec.h>
+#include <openssl/crypto.h>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -54,9 +67,14 @@ using json = nlohmann::json;
 #define HOST_NAME_MAX 256
 #endif
 
-// ============================================================
-// CONSTANTES
-// ============================================================
+void broadcast_p2p(const std::string& msg);
+std::string get_telemetry(const std::string& node_id);
+std::string get_neighbors_list();
+std::string neuro_decrypt(std::string cipher);
+int recv_full(int sock, char* buffer, size_t total_len, int flags = 0);
+void handle_pbft_message(const json& msg);
+void pbft_cleanup_and_retransmit();
+
 #define RSA_KEY_BITS        2048
 #define RSA_PADDING         RSA_PKCS1_OAEP_PADDING
 #define RSA_OAEP_MD         EVP_sha256()
@@ -64,26 +82,30 @@ using json = nlohmann::json;
 #define AES_KEY_LEN         32
 #define AES_GCM_IV_LEN      12
 #define AES_GCM_TAG_LEN     16
-#define SESSION_MATERIAL_LEN (AES_KEY_LEN + AES_GCM_IV_LEN) // 44
+#define SESSION_MATERIAL_LEN (AES_KEY_LEN + AES_GCM_IV_LEN)
 #define RECV_BUFFER_SIZE    65536
 #define RSA_ENCRYPTED_LEN   256
 #define P2P_MULTICAST_IP    "239.0.0.1"
 #define P2P_MULTICAST_PORT  9999
 #define C2_PORT             8080
+#define WS_PORT             (8082 + (GET_PID() % 1000))
 #define MAX_BACKOFF_MS      60000
 #define IA_CMD_FILE         "ia_commands.txt"
 #define MAX_HONEYPOT_THREADS 50
 #define AGENT_AUTH_TOKEN    "NEURO_MESH_SECRET"
 
+#define IA_HISTORY_LIMIT    50
+#define IA_LEARNING_WARMUP  5
+#define IA_ZSCORE_THRESHOLD 3.5
+
 #define CRYPTO_KEY 0x42
 
-static const unsigned char P2P_HMAC_STATIC_KEY[] = {
-    0x13, 0x37, 0x42, 0x69, 0x42, 0x65, 0x65, 0x66,
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
-};
+#define PBFT_PHASE_TIMEOUT_MS  3000
+#define PBFT_MAX_ROUNDS        3
+#define PBFT_QUORUM_MULTIPLIER 0.66
+#define MSG_TIMESTAMP_TTL_SEC  5
 
+std::atomic<bool> keep_running{true};
 std::atomic<bool> honeypot_triggered{false};
 std::atomic<bool> is_isolated{false};
 std::atomic<int> report_interval{5000};
@@ -91,174 +113,50 @@ std::atomic<unsigned int> active_honeypot_threads{0};
 std::atomic<bool> signal_pending{false};
 
 unsigned char session_key[AES_KEY_LEN];
-std::string hmac_key;
 
-// ============================================================
-// UTILITAIRES
-// ============================================================
-std::string neuro_decrypt(std::string cipher) {
-    for (size_t i = 0; i < cipher.size(); ++i) cipher[i] ^= CRYPTO_KEY;
-    return cipher;
-}
+int g_udp_send_sock = -1;
+std::mutex g_udp_send_mutex;
 
-int recv_full(int sock, char* buffer, size_t total_len, int flags = 0) {
-    size_t received = 0;
-    while (received < total_len) {
-        int r = recv(sock, buffer + received, total_len - received, flags);
-        if (r <= 0) return -1;
-        received += r;
-    }
-    return (int)received;
-}
-
-// ============================================================
-// CRYPTO AES-GCM
-// ============================================================
-std::string encrypt_aes256_gcm(const std::string& plaintext, const unsigned char* key, unsigned char* iv_out) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return "";
-    RAND_bytes(iv_out, AES_GCM_IV_LEN);
-    std::vector<unsigned char> ciphertext(plaintext.size() + AES_GCM_TAG_LEN);
-    int len = 0, ciphertext_len = 0;
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key, iv_out) != 1 ||
-        EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const unsigned char*)plaintext.c_str(), plaintext.size()) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return "";
-    }
-    ciphertext_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return ""; }
-    ciphertext_len += len;
-    unsigned char tag[AES_GCM_TAG_LEN];
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_LEN, tag) != 1) { EVP_CIPHER_CTX_free(ctx); return ""; }
-    EVP_CIPHER_CTX_free(ctx);
-    std::string result((char*)iv_out, AES_GCM_IV_LEN);
-    result.append((char*)ciphertext.data(), ciphertext_len);
-    result.append((char*)tag, AES_GCM_TAG_LEN);
-    return result;
-}
-
-std::string decrypt_aes256_gcm(const unsigned char* full_msg, size_t full_len, const unsigned char* key) {
-    if (full_len < AES_GCM_IV_LEN + AES_GCM_TAG_LEN) return "ERREUR";
-    unsigned char iv[AES_GCM_IV_LEN];
-    memcpy(iv, full_msg, AES_GCM_IV_LEN);
-    const unsigned char* ciphertext = full_msg + AES_GCM_IV_LEN;
-    size_t ciphertext_len = full_len - AES_GCM_IV_LEN - AES_GCM_TAG_LEN;
-    const unsigned char* tag = full_msg + AES_GCM_IV_LEN + ciphertext_len;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return "ERREUR";
-    std::vector<unsigned char> plaintext(ciphertext_len);
-    int len = 0, plaintext_len = 0;
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key, iv) != 1 ||
-        EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx); return "ERREUR";
-    }
-    plaintext_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_LEN, (void*)tag) != 1) { EVP_CIPHER_CTX_free(ctx); return "ERREUR"; }
-    if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return "ERREUR"; }
-    plaintext_len += len;
-    EVP_CIPHER_CTX_free(ctx);
-    return std::string((char*)plaintext.data(), plaintext_len);
-}
-
-// ============================================================
-// RSA
-// ============================================================
-std::string rsa_encrypt(EVP_PKEY* pub_key, const unsigned char* data, size_t data_len) {
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub_key, nullptr);
-    if (!ctx) return "";
-    if (EVP_PKEY_encrypt_init(ctx) <= 0) { EVP_PKEY_CTX_free(ctx); return ""; }
-    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PADDING) <= 0 ||
-        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, RSA_OAEP_MD) <= 0 ||
-        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, RSA_MGF1_MD) <= 0) {
-        EVP_PKEY_CTX_free(ctx); return "";
-    }
-    size_t outlen = 0;
-    if (EVP_PKEY_encrypt(ctx, nullptr, &outlen, data, data_len) <= 0) { EVP_PKEY_CTX_free(ctx); return ""; }
-    unsigned char* out = new unsigned char[outlen];
-    if (EVP_PKEY_encrypt(ctx, out, &outlen, data, data_len) <= 0) { delete[] out; EVP_PKEY_CTX_free(ctx); return ""; }
-    std::string result((char*)out, outlen);
-    delete[] out; EVP_PKEY_CTX_free(ctx);
-    return result;
-}
-
-// ============================================================
-// HONEYPOT (CORRIGÉ AVEC MAX_TICKS)
-// ============================================================
-void tarpit_handler(int client_socket) {
-    const char* banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2\r\n";
-    send(client_socket, banner, strlen(banner), 0);
-    int max_ticks = 300; // Force la coupure après env. 10 minutes d'attaque
-    while (max_ticks-- > 0) {
-        char poison[1024];
-        for (int i = 0; i < 1024; ++i) poison[i] = rand() % 256;
-        if (send(client_socket, poison, 1024, 0) <= 0) break;
-        SLEEP_MS(is_isolated ? 100 : 2000);
-    }
-    CLOSE_SOCKET(client_socket);
-    active_honeypot_threads--;
-}
-
-void tarpit_honeypot() {
-#ifdef _WIN32
-    SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
-#else
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef __linux__
+std::unique_ptr<std::ifstream> g_netdev;
+std::unique_ptr<std::ifstream> g_diskstats;
+std::unique_ptr<std::ifstream> g_filenr;
+std::unique_ptr<std::ifstream> g_proc_stat;
 #endif
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
 
-    int port = 2222;
-    address.sin_port = htons(port);
-    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        port++;
-        address.sin_port = htons(port);
-        if (port > 2250) return;
-    }
-    listen(server_fd, 10);
-    std::cout << "\033[1;35m[MIRAGE]\033[0m Honeypot activé (Port " << port << ").\033[0m" << std::endl;
-
-    while (true) {
-        struct sockaddr_in client_addr;
-#ifdef _WIN32
-        int addrlen = sizeof(client_addr);
-        SOCKET client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
-#else
-        socklen_t addrlen = sizeof(client_addr);
-        int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+void init_system_metrics() {
+#ifdef __linux__
+    g_netdev = std::make_unique<std::ifstream>("/proc/net/dev");
+    g_diskstats = std::make_unique<std::ifstream>("/proc/diskstats");
+    g_filenr = std::make_unique<std::ifstream>("/proc/sys/fs/file-nr");
+    g_proc_stat = std::make_unique<std::ifstream>("/proc/stat");
 #endif
-        if (client_socket < 0) continue;
-
-        if (active_honeypot_threads >= MAX_HONEYPOT_THREADS) {
-            CLOSE_SOCKET(client_socket);
-            continue;
-        }
-
-        char attacker_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, attacker_ip, INET_ADDRSTRLEN);
-        std::cout << "\033[1;41;37m [!!! INTRUSION DÉTECTÉE SUR LE HONEYPOT (Port " << port << ") !!!] \033[0m Cible: " << attacker_ip << std::endl;
-
-        if (!honeypot_triggered) {
-            std::ofstream report("incident_report.txt", std::ios::app);
-            time_t now = time(0);
-            report << "==========================================\n";
-            report << "[ALERTE CRITIQUE] DATE: " << ctime(&now);
-            report << "[SOURCE] IP ATTAQUANT : " << attacker_ip << "\n";
-            report << "[VECTEUR] Port Honeypot : " << port << "\n";
-            report << "==========================================\n";
-            report.close();
-            std::cout << "\033[1;33m[DOC]\033[0m Preuve cryptographique générée : incident_report.txt\n";
-        }
-        honeypot_triggered = true;
-        active_honeypot_threads++;
-        std::thread([client_socket]() { tarpit_handler(client_socket); }).detach();
-    }
 }
 
-// ============================================================
-// P2P BULLY
-// ============================================================
+void init_p2p_socket() {
+    g_udp_send_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_udp_send_sock < 0) throw std::runtime_error("Erreur socket UDP");
+    int loopback = 1;
+    setsockopt(g_udp_send_sock, IPPROTO_IP, IP_MULTICAST_LOOP, (char*)&loopback, sizeof(loopback));
+}
+
+struct MetricSample {
+    long ram_mb; double cpu_load; long long net_tx_bs; long long net_rx_bs;
+    long long disk_io_bs; long proc_count; long file_open_rate;
+};
+std::deque<MetricSample> history;
+std::mutex history_mutex;
+bool ia_warmup_done = false;
+
+double running_mean[7] = {0};
+double running_M2[7] = {0};
+int running_count = 0;
+
+std::string current_json_state;
+std::mutex json_mutex;
+std::set<int> ws_clients;
+std::mutex ws_mutex;
+
 struct Neighbor { std::string id; std::string ip; int priority_score; time_t last_seen; };
 enum AgentState { NORMAL, ELECTION_MODE, COORDINATOR_MODE };
 std::atomic<AgentState> current_state{NORMAL};
@@ -267,210 +165,505 @@ std::string current_leader_id = "";
 std::vector<Neighbor> active_mesh;
 std::mutex mesh_mutex;
 
-std::string hmac_sha256(const std::string& key, const std::string& message) {
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int digest_len = 0;
-    HMAC(EVP_sha256(), key.c_str(), key.size(), (const unsigned char*)message.c_str(), message.size(), digest, &digest_len);
-    return std::string((char*)digest, digest_len);
+std::string base64_decode(const std::string& input) {
+    static const std::string b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; std::vector<int> T(256, -1);
+    for (int i = 0; i < 64; i++) T[b64[i]] = i;
+    unsigned int val = 0; int valb = -8;
+    for (unsigned char c : input) {
+        if (c == '=') break;
+        if (T[c] == -1) continue;
+        val = (val << 6) + T[c]; valb += 6;
+        if (valb >= 0) { out.push_back(char((val >> valb) & 0xFF)); valb -= 8; }
+    }
+    return out;
 }
 
-std::string get_p2p_hmac_key() { return std::string((char*)P2P_HMAC_STATIC_KEY, sizeof(P2P_HMAC_STATIC_KEY)); }
-
-bool verify_hmac(const std::string& key, const std::string& message, const std::string& received_hmac) {
-    std::string computed = hmac_sha256(key, message);
-    if (computed.size() != received_hmac.size()) return false;
-    return CRYPTO_memcmp(computed.data(), received_hmac.data(), computed.size()) == 0;
+std::string base64_encode(const unsigned char* input, int length) {
+    static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result; int i = 0; unsigned char c3[3], c4[4];
+    while (length--) {
+        c3[i++] = *(input++);
+        if (i == 3) {
+            c4[0] = (c3[0] & 0xfc) >> 2; c4[1] = ((c3[0] & 0x03) << 4) + ((c3[1] & 0xf0) >> 4);
+            c4[2] = ((c3[1] & 0x0f) << 2) + ((c3[2] & 0xc0) >> 6); c4[3] = c3[2] & 0x3f;
+            for (i = 0; i < 4; i++) result += b64[c4[i]];
+            i = 0;
+        }
+    }
+    if (i) {
+        for (int j = i; j < 3; j++) c3[j] = '\0';
+        c4[0] = (c3[0] & 0xfc) >> 2; c4[1] = ((c3[0] & 0x03) << 4) + ((c3[1] & 0xf0) >> 4);
+        c4[2] = ((c3[1] & 0x0f) << 2) + ((c3[2] & 0xc0) >> 6);
+        for (int j = 0; j < i + 1; j++) result += b64[c4[j]];
+        while (i++ < 3) result += '=';
+    }
+    return result;
 }
 
-std::string sign_message(const std::string& key, const std::string& msg) {
-    return msg + "|" + hmac_sha256(key, msg);
+namespace pbft {
+    struct Identity { std::string node_id; EVP_PKEY* privkey; std::string pubkey_pem; };
+    struct PeerInfo { std::string id; EVP_PKEY* pubkey; time_t last_seen; };
+    enum PBFType { HEARTBEAT = 0, REQUEST, PRE_PREPARE, PREPARE, COMMIT, REPLY };
+    enum Phase { IDLE, WAITING_PREPARE, WAITING_COMMIT, DECIDED };
+
+    struct Consensus {
+        uint64_t view; uint64_t seq; std::string digest; std::string proposal; Phase phase;
+        std::chrono::steady_clock::time_point start_time;
+        std::set<std::string> prepare_votes; std::set<std::string> commit_votes;
+        bool decided; bool decision_value; int round;
+    };
+
+    std::mutex crypto_mutex;
+    Identity my_identity;
+    std::map<std::string, PeerInfo> known_peers;
+    std::mutex peers_mutex;
+    std::list<Consensus> active_instances;
+    std::mutex instances_mutex;
+    std::atomic<uint64_t> next_seq{1};
+    std::atomic<uint64_t> current_view{0};
+
+    std::string sign_data(EVP_PKEY* privkey, const std::string& data) {
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        if (!ctx) return "";
+        if (EVP_DigestSignInit(ctx, nullptr, nullptr, nullptr, privkey) != 1) { EVP_MD_CTX_free(ctx); return ""; }
+        size_t sig_len = 0;
+        if (EVP_DigestSign(ctx, nullptr, &sig_len, (const unsigned char*)data.c_str(), data.size()) != 1) { EVP_MD_CTX_free(ctx); return ""; }
+        std::vector<unsigned char> sig(sig_len);
+        if (EVP_DigestSign(ctx, sig.data(), &sig_len, (const unsigned char*)data.c_str(), data.size()) != 1) { EVP_MD_CTX_free(ctx); return ""; }
+        EVP_MD_CTX_free(ctx);
+        return std::string((char*)sig.data(), sig_len);
+    }
+
+    bool verify_sig(EVP_PKEY* pubkey, const std::string& data, const std::string& signature) {
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        if (!ctx) return false;
+        if (EVP_DigestVerifyInit(ctx, nullptr, nullptr, nullptr, pubkey) != 1) { EVP_MD_CTX_free(ctx); return false; }
+        int ok = EVP_DigestVerify(ctx, (const unsigned char*)signature.c_str(), signature.size(),
+                                  (const unsigned char*)data.c_str(), data.size());
+        EVP_MD_CTX_free(ctx);
+        return (ok == 1);
+    }
+
+    EVP_PKEY* generate_ed25519_key() {
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+        if (!pctx) return nullptr;
+        if (EVP_PKEY_keygen_init(pctx) <= 0) { EVP_PKEY_CTX_free(pctx); return nullptr; }
+        EVP_PKEY* key = nullptr;
+        if (EVP_PKEY_keygen(pctx, &key) != 1) { EVP_PKEY_CTX_free(pctx); return nullptr; }
+        EVP_PKEY_CTX_free(pctx);
+        return key;
+    }
+
+    std::string pubkey_to_pem(EVP_PKEY* key) {
+        BIO* bio = BIO_new(BIO_s_mem());
+        if (!bio) return "";
+        if (PEM_write_bio_PUBKEY(bio, key) != 1) { BIO_free(bio); return ""; }
+        char* data; long len = BIO_get_mem_data(bio, &data);
+        std::string pem(data, len); BIO_free(bio);
+        return pem;
+    }
+
+    EVP_PKEY* pem_to_pubkey(const std::string& pem) {
+        BIO* bio = BIO_new_mem_buf(pem.data(), pem.size());
+        if (!bio) return nullptr;
+        EVP_PKEY* key = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+        return key;
+    }
+
+    std::string sha256(const std::string& data) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256((const unsigned char*)data.c_str(), data.size(), hash);
+        return std::string((char*)hash, SHA256_DIGEST_LENGTH);
+    }
+}
+
+std::string format_pbft_msg(pbft::PBFType type, uint64_t view, uint64_t seq,
+                            const std::string& digest, const std::string& sender,
+                            const std::string& signature, uint64_t timestamp) {
+    json j; j["type"] = (int)type; j["view"] = view; j["seq"] = seq; j["digest"] = digest; j["sender"] = sender;
+    j["sig"] = base64_encode((const unsigned char*)signature.c_str(), signature.size()); j["timestamp"] = timestamp;
+    return j.dump();
+}
+
+std::string data_to_sign(pbft::PBFType type, uint64_t view, uint64_t seq, const std::string& digest, const std::string& sender, uint64_t timestamp) {
+    std::ostringstream oss; oss << (int)type << "|" << view << "|" << seq << "|" << digest << "|" << sender << "|" << timestamp;
+    return oss.str();
+}
+
+void pbft_init_identity(const std::string& node_id) {
+    pbft::my_identity.node_id = node_id;
+    pbft::my_identity.privkey = pbft::generate_ed25519_key();
+    if (!pbft::my_identity.privkey) { std::cerr << "Erreur clé Ed25519\n"; exit(1); }
+    pbft::my_identity.pubkey_pem = pbft::pubkey_to_pem(pbft::my_identity.privkey);
+}
+
+void pbft_broadcast_heartbeat() {
+    std::lock_guard<std::mutex> lock(pbft::crypto_mutex);
+    uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string data = data_to_sign(pbft::HEARTBEAT, 0, 0, "", pbft::my_identity.node_id, ts);
+    std::string sig = pbft::sign_data(pbft::my_identity.privkey, data);
+    json j; j["type"] = (int)pbft::HEARTBEAT; j["node_id"] = pbft::my_identity.node_id;
+    j["pubkey"] = pbft::my_identity.pubkey_pem; j["sig"] = base64_encode((const unsigned char*)sig.c_str(), sig.size());
+    j["timestamp"] = ts; broadcast_p2p("PBFT:" + j.dump());
+}
+
+void pbft_propose_isolation(const std::string& suspect_id) {
+    if (is_isolated) return;
+    uint64_t view = ++pbft::current_view; uint64_t seq = pbft::next_seq++;
+    std::string proposal = "ISOLATE:" + suspect_id; std::string digest = pbft::sha256(proposal);
+    uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    pbft::Consensus cons; cons.view = view; cons.seq = seq; cons.digest = digest; cons.proposal = proposal;
+    cons.phase = pbft::WAITING_PREPARE; cons.start_time = std::chrono::steady_clock::now(); cons.decided = false; cons.decision_value = true; cons.round = 1;
+    { std::lock_guard<std::mutex> lock(pbft::instances_mutex); pbft::active_instances.push_back(cons); }
+
+    std::lock_guard<std::mutex> lock(pbft::crypto_mutex);
+    std::string data_to_sig = data_to_sign(pbft::PRE_PREPARE, view, seq, digest, pbft::my_identity.node_id, ts);
+    std::string sig = pbft::sign_data(pbft::my_identity.privkey, data_to_sig);
+    broadcast_p2p("PBFT:" + format_pbft_msg(pbft::PRE_PREPARE, view, seq, digest, pbft::my_identity.node_id, sig, ts));
+}
+
+void handle_pbft_message(const json& msg) {
+    try {
+        if (!msg.contains("timestamp")) return;
+        uint64_t msg_ts = msg["timestamp"];
+        uint64_t now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (std::abs((int64_t)now_ts - (int64_t)msg_ts) > MSG_TIMESTAMP_TTL_SEC) return;
+
+        pbft::PBFType type = (pbft::PBFType)msg.at("type").get<int>();
+        uint64_t view = msg.at("view"); uint64_t seq = msg.at("seq");
+        std::string digest = msg.at("digest"); std::string sender = msg.at("sender");
+        std::string sig = base64_decode(msg.at("sig").get<std::string>());
+
+        std::lock_guard<std::mutex> peer_lock(pbft::peers_mutex);
+        if (pbft::known_peers.find(sender) == pbft::known_peers.end()) return;
+        EVP_PKEY* sender_pub = pbft::known_peers[sender].pubkey;
+
+        std::string data_to_check = data_to_sign(type, view, seq, digest, sender, msg_ts);
+        {
+            std::lock_guard<std::mutex> crypto_lock(pbft::crypto_mutex);
+            if (!pbft::verify_sig(sender_pub, data_to_check, sig)) return;
+        }
+
+        switch (type) {
+            case pbft::PRE_PREPARE: {
+                if (sender == pbft::my_identity.node_id) break;
+                std::lock_guard<std::mutex> inst_lock(pbft::instances_mutex);
+                bool found = false;
+                for (auto& inst : pbft::active_instances) {
+                    if (inst.seq == seq && inst.view == view && inst.digest == digest) {
+                        found = true;
+                        if (inst.phase == pbft::IDLE || inst.phase == pbft::WAITING_PREPARE) {
+                            inst.phase = pbft::WAITING_COMMIT;
+                            std::lock_guard<std::mutex> cl(pbft::crypto_mutex);
+                            uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                            std::string ds = data_to_sign(pbft::PREPARE, view, seq, digest, pbft::my_identity.node_id, ts);
+                            std::string s = pbft::sign_data(pbft::my_identity.privkey, ds);
+                            broadcast_p2p("PBFT:" + format_pbft_msg(pbft::PREPARE, view, seq, digest, pbft::my_identity.node_id, s, ts));
+                        }
+                        break;
+                    }
+                }
+                if (!found) {
+                    pbft::Consensus new_inst; new_inst.view = view; new_inst.seq = seq; new_inst.digest = digest;
+                    new_inst.proposal = "?"; new_inst.phase = pbft::WAITING_COMMIT;
+                    new_inst.start_time = std::chrono::steady_clock::now(); new_inst.decided = false; new_inst.round = 1;
+                    pbft::active_instances.push_back(new_inst);
+                    std::lock_guard<std::mutex> cl(pbft::crypto_mutex);
+                    uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::string ds = data_to_sign(pbft::PREPARE, view, seq, digest, pbft::my_identity.node_id, ts);
+                    std::string s = pbft::sign_data(pbft::my_identity.privkey, ds);
+                    broadcast_p2p("PBFT:" + format_pbft_msg(pbft::PREPARE, view, seq, digest, pbft::my_identity.node_id, s, ts));
+                }
+                break;
+            }
+            case pbft::PREPARE: {
+                if (sender == pbft::my_identity.node_id) break;
+                std::lock_guard<std::mutex> inst_lock(pbft::instances_mutex);
+                for (auto& inst : pbft::active_instances) {
+                    if (inst.seq == seq && inst.view == view && inst.digest == digest) {
+                        inst.prepare_votes.insert(sender);
+                        size_t total_nodes = pbft::known_peers.size() + 1;
+                        size_t quorum = std::max((size_t)(total_nodes * PBFT_QUORUM_MULTIPLIER), (size_t)1);
+                        if (inst.prepare_votes.size() >= quorum && inst.phase == pbft::WAITING_COMMIT) {
+                            inst.phase = pbft::DECIDED;
+                            std::lock_guard<std::mutex> cl(pbft::crypto_mutex);
+                            uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                            std::string ds = data_to_sign(pbft::COMMIT, view, seq, digest, pbft::my_identity.node_id, ts);
+                            std::string s = pbft::sign_data(pbft::my_identity.privkey, ds);
+                            broadcast_p2p("PBFT:" + format_pbft_msg(pbft::COMMIT, view, seq, digest, pbft::my_identity.node_id, s, ts));
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+            case pbft::COMMIT: {
+                if (sender == pbft::my_identity.node_id) break;
+                std::lock_guard<std::mutex> inst_lock(pbft::instances_mutex);
+                for (auto& inst : pbft::active_instances) {
+                    if (inst.seq == seq && inst.view == view && inst.digest == digest) {
+                        inst.commit_votes.insert(sender);
+                        size_t total_nodes = pbft::known_peers.size() + 1;
+                        size_t quorum = std::max((size_t)(total_nodes * PBFT_QUORUM_MULTIPLIER), (size_t)1);
+                        if (inst.commit_votes.size() >= quorum && !inst.decided) {
+                            inst.decided = true; inst.decision_value = true;
+                            if (inst.proposal.find("ISOLATE:" + pbft::my_identity.node_id) == 0 && !is_isolated) {
+                                std::cout << "\033[1;41;37m[PBFT] Auto-isolation confirmée!\033[0m\n";
+                                is_isolated = true; report_interval = 1000; current_state = NORMAL;
+                            }
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+            default: break;
+        }
+    } catch (...) {}
+}
+
+void pbft_cleanup_and_retransmit() {
+    {
+        std::lock_guard<std::mutex> inst_lock(pbft::instances_mutex);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = pbft::active_instances.begin(); it != pbft::active_instances.end(); ) {
+            if (it->decided) { it = pbft::active_instances.erase(it); continue; }
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->start_time).count();
+            if (elapsed > PBFT_PHASE_TIMEOUT_MS * it->round) {
+                if (it->round < PBFT_MAX_ROUNDS) {
+                    std::lock_guard<std::mutex> cl(pbft::crypto_mutex);
+                    uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::string ds = data_to_sign((it->phase == pbft::WAITING_COMMIT) ? pbft::PREPARE : pbft::PRE_PREPARE,
+                                                  it->view, it->seq, it->digest, pbft::my_identity.node_id, ts);
+                    std::string s = pbft::sign_data(pbft::my_identity.privkey, ds);
+                    broadcast_p2p("PBFT:" + format_pbft_msg((it->phase == pbft::WAITING_COMMIT) ? pbft::PREPARE : pbft::PRE_PREPARE,
+                                                            it->view, it->seq, it->digest, pbft::my_identity.node_id, s, ts));
+                    it->round++; it->start_time = now; ++it;
+                } else {
+                    it = pbft::active_instances.erase(it);
+                }
+            } else { ++it; }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> peer_lock(pbft::peers_mutex);
+        time_t now = time(nullptr);
+        for (auto it = pbft::known_peers.begin(); it != pbft::known_peers.end(); ) {
+            if (now - it->second.last_seen > 30) { EVP_PKEY_free(it->second.pubkey); it = pbft::known_peers.erase(it); }
+            else { ++it; }
+        }
+    }
+}
+
+std::string encrypt_aes256_gcm(const std::string& plaintext, const unsigned char* key, unsigned char* iv_out) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    RAND_bytes(iv_out, AES_GCM_IV_LEN);
+    std::vector<unsigned char> ciphertext(plaintext.size() + AES_GCM_TAG_LEN);
+    int len = 0, ciphertext_len = 0;
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key, iv_out);
+    EVP_EncryptUpdate(ctx, ciphertext.data(), &len, (const unsigned char*)plaintext.c_str(), plaintext.size());
+    ciphertext_len = len;
+    EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len);
+    ciphertext_len += len;
+    unsigned char tag[AES_GCM_TAG_LEN]; EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, AES_GCM_TAG_LEN, tag);
+    EVP_CIPHER_CTX_free(ctx);
+    std::string result((char*)iv_out, AES_GCM_IV_LEN);
+    result.append((char*)ciphertext.data(), ciphertext_len); result.append((char*)tag, AES_GCM_TAG_LEN);
+    return result;
+}
+
+std::string decrypt_aes256_gcm(const unsigned char* full_msg, size_t full_len, const unsigned char* key) {
+    if (full_len < AES_GCM_IV_LEN + AES_GCM_TAG_LEN) return "ERREUR";
+    unsigned char iv[AES_GCM_IV_LEN]; memcpy(iv, full_msg, AES_GCM_IV_LEN);
+    const unsigned char* ciphertext = full_msg + AES_GCM_IV_LEN;
+    size_t ciphertext_len = full_len - AES_GCM_IV_LEN - AES_GCM_TAG_LEN;
+    const unsigned char* tag = full_msg + AES_GCM_IV_LEN + ciphertext_len;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    std::vector<unsigned char> plaintext(ciphertext_len); int len = 0, plaintext_len = 0;
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key, iv);
+    EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len); plaintext_len = len;
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_LEN, (void*)tag);
+    if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1) { EVP_CIPHER_CTX_free(ctx); return "ERREUR"; }
+    plaintext_len += len; EVP_CIPHER_CTX_free(ctx);
+    return std::string((char*)plaintext.data(), plaintext_len);
+}
+
+std::string rsa_encrypt(EVP_PKEY* pub_key, const unsigned char* data, size_t data_len) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub_key, nullptr);
+    if (!ctx) return "";
+    EVP_PKEY_encrypt_init(ctx); 
+    EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PADDING);
+    EVP_PKEY_CTX_set_rsa_oaep_md(ctx, RSA_OAEP_MD);
+    EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, RSA_MGF1_MD);
+
+    size_t outlen = 0; 
+    EVP_PKEY_encrypt(ctx, nullptr, &outlen, data, data_len);
+    unsigned char* out = new unsigned char[outlen];
+    EVP_PKEY_encrypt(ctx, out, &outlen, data, data_len);
+    std::string result((char*)out, outlen); 
+    delete[] out; 
+    EVP_PKEY_CTX_free(ctx);
+    return result;
+}
+
+void tarpit_handler(int client_socket) {
+    const char* banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2\r\n";
+    send(client_socket, banner, strlen(banner), 0);
+    int max_ticks = 300;
+    while (max_ticks-- > 0 && keep_running) {
+        char poison[1024]; for (int i = 0; i < 1024; ++i) poison[i] = rand() % 256;
+        if (send(client_socket, poison, 1024, 0) <= 0) break;
+        SLEEP_MS(is_isolated ? 100 : 2000);
+    }
+    CLOSE_SOCKET(client_socket); active_honeypot_threads--;
+}
+
+void tarpit_honeypot() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    struct sockaddr_in address; address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY;
+    int port = 2222; address.sin_port = htons(port);
+    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { port++; address.sin_port = htons(port); if (port > 2250) return; }
+    listen(server_fd, 10);
+
+    int flags = fcntl(server_fd, F_GETFL, 0); fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+    while (keep_running) {
+        struct sockaddr_in client_addr; socklen_t addrlen = sizeof(client_addr);
+        int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+        if (client_socket < 0) { SLEEP_MS(500); continue; }
+
+        if (active_honeypot_threads >= MAX_HONEYPOT_THREADS) { CLOSE_SOCKET(client_socket); continue; }
+        honeypot_triggered = true; active_honeypot_threads++;
+        std::thread([client_socket]() { tarpit_handler(client_socket); }).detach();
+    }
+    CLOSE_SOCKET(server_fd);
+}
+
+void collect_local_metrics(long& ram, double& cpu, long long& net_tx, long long& net_rx,
+                           long long& disk_io, long& proc_count, long& file_rate) {
+#ifdef __linux__
+    struct sysinfo memInfo; sysinfo(&memInfo);
+    ram = (memInfo.totalram - memInfo.freeram) / (1024 * 1024);
+    double loads[1]; cpu = (getloadavg(loads, 1) != -1) ? loads[0] : 0.0;
+
+    // 🔥 FIX CPU MATH : Lecture directe des coeurs physiques/logiques du processeur
+    proc_count = std::thread::hardware_concurrency();
+    if (proc_count == 0) proc_count = 1; // Fallback par sécurité
+
+    file_rate = 0;
+    if (g_filenr && g_filenr->is_open()) { g_filenr->clear(); g_filenr->seekg(0); long a, b, c; (*g_filenr) >> a >> b >> c; file_rate = a; }
+
+    static unsigned long long last_tx = 0, last_rx = 0; static auto last_time = std::chrono::steady_clock::now();
+    unsigned long long tx = 0, rx = 0;
+    if (g_netdev && g_netdev->is_open()) {
+        g_netdev->clear(); g_netdev->seekg(0); std::string line; std::getline(*g_netdev, line); std::getline(*g_netdev, line);
+        while (std::getline(*g_netdev, line)) {
+            size_t c = line.find(':'); if (c == std::string::npos) continue;
+            std::string iface = line.substr(0, c); if (iface.find("lo") != std::string::npos) continue;
+            std::istringstream iss(line.substr(c + 1));
+            unsigned long long r_b, r_p, r_e, r_d, r_f, r_fr, r_c, r_m, t_b;
+            iss >> r_b >> r_p >> r_e >> r_d >> r_f >> r_fr >> r_c >> r_m >> t_b;
+            rx += r_b; tx += t_b;
+        }
+    }
+    auto now = std::chrono::steady_clock::now(); double elapsed = std::chrono::duration<double>(now - last_time).count();
+    if (elapsed > 0.0) { net_tx = (tx - last_tx) / elapsed; net_rx = (rx - last_rx) / elapsed; } else { net_tx = net_rx = 0; }
+    last_tx = tx; last_rx = rx; last_time = now;
+
+    disk_io = 0;
+    if (g_diskstats && g_diskstats->is_open()) {
+        g_diskstats->clear(); g_diskstats->seekg(0); std::string line;
+        while (std::getline(*g_diskstats, line)) {
+            if (line.find("sda") != std::string::npos || line.find("nvme0n1") != std::string::npos) {
+                std::istringstream iss(line); long long d, rs, ws; std::string dev;
+                iss >> d >> d >> dev >> d >> d >> rs >> d >> d >> d >> ws;
+                disk_io = (rs + ws) * 512; break;
+            }
+        }
+    }
+#else
+    ram = cpu = net_tx = net_rx = disk_io = proc_count = file_rate = 0;
+#endif
+}
+
+void update_ia_history(long ram, double cpu, long long net_tx, long long net_rx,
+                       long long disk_io, long proc_count, long file_rate) {
+    std::lock_guard<std::mutex> lock(history_mutex);
+    MetricSample sample = {ram, cpu, net_tx, net_rx, disk_io, proc_count, file_rate};
+    history.push_back(sample); if (history.size() > IA_HISTORY_LIMIT) history.pop_front();
+    if (history.size() >= IA_LEARNING_WARMUP) ia_warmup_done = true;
+
+    running_count++;
+    double values[7] = {(double)ram, cpu, (double)net_tx, (double)net_rx, (double)disk_io, (double)proc_count, (double)file_rate};
+    for (int i = 0; i < 7; i++) {
+        double delta = values[i] - running_mean[i];
+        running_mean[i] += delta / running_count;
+        running_M2[i] += delta * (values[i] - running_mean[i]);
+    }
+}
+
+bool ia_check_anomaly(long ram, double cpu, long long net_tx, long long net_rx,
+                      long long disk_io, long proc_count, long file_rate) {
+    if (!ia_warmup_done || running_count < 2) return false;
+    double cur[7] = {(double)ram, cpu, (double)net_tx, (double)net_rx, (double)disk_io, (double)proc_count, (double)file_rate};
+    for (int i = 0; i < 7; i++) {
+        double stddev = std::sqrt(running_M2[i] / (running_count - 1));
+        if (stddev == 0) continue;
+        bool increase_only = (i == 0 || i == 1 || i == 2 || i == 4);
+        if (increase_only) {
+            if (cur[i] > running_mean[i] && ((cur[i] - running_mean[i]) / stddev) > IA_ZSCORE_THRESHOLD) return true;
+        } else {
+            if ((std::abs(cur[i] - running_mean[i]) / stddev) > IA_ZSCORE_THRESHOLD) return true;
+        }
+    }
+    return false;
+}
+
+void broadcast_p2p(const std::string& msg) {
+    if (g_udp_send_sock < 0) return;
+    struct sockaddr_in mcast_addr; mcast_addr.sin_family = AF_INET; mcast_addr.sin_port = htons(P2P_MULTICAST_PORT); mcast_addr.sin_addr.s_addr = inet_addr(P2P_MULTICAST_IP);
+    std::lock_guard<std::mutex> lock(g_udp_send_mutex);
+    sendto(g_udp_send_sock, msg.c_str(), msg.length(), 0, (struct sockaddr*)&mcast_addr, sizeof(mcast_addr));
+}
+
+void broadcast_bully_signed(const std::string& type, const std::string& payload) {
+    uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string pk_b64 = base64_encode((const unsigned char*)pbft::my_identity.pubkey_pem.c_str(), pbft::my_identity.pubkey_pem.size());
+    std::string full_msg = type + "|" + pbft::my_identity.node_id + "|" + payload + "|" + std::to_string(ts) + "|" + pk_b64;
+    std::string sig = pbft::sign_data(pbft::my_identity.privkey, full_msg);
+    broadcast_p2p("BULLY:" + full_msg + "|" + base64_encode((unsigned char*)sig.c_str(), sig.size()));
 }
 
 int calculate_priority() {
     long usedRAM = 0; int procs = 0;
-#ifdef _WIN32
-    MEMORYSTATUSEX statex; statex.dwLength = sizeof(statex); GlobalMemoryStatusEx(&statex);
-    usedRAM = (statex.ullTotalPhys - statex.ullAvailPhys) / (1024 * 1024);
-    SYSTEM_INFO sysinfo; GetSystemInfo(&sysinfo); procs = sysinfo.dwNumberOfProcessors;
-#else
+#ifdef __linux__
     struct sysinfo memInfo; sysinfo(&memInfo);
-    long total = (memInfo.totalram * memInfo.mem_unit) / (1024 * 1024);
-    long free = (memInfo.freeram * memInfo.mem_unit) / (1024 * 1024);
-    usedRAM = total - free;
-    procs = memInfo.procs;
+    usedRAM = (memInfo.totalram - memInfo.freeram) / (1024 * 1024); procs = memInfo.procs;
 #endif
     return (procs * 1000) + (int)usedRAM;
 }
 
-void broadcast_p2p(const std::string& msg) {
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    char loopback = 1;
-#else
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    int loopback = 1;
-#endif
-    setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP, (char*)&loopback, sizeof(loopback));
-    struct sockaddr_in mcast_addr;
-    mcast_addr.sin_family = AF_INET;
-    mcast_addr.sin_port = htons(P2P_MULTICAST_PORT);
-    mcast_addr.sin_addr.s_addr = inet_addr(P2P_MULTICAST_IP);
-    sendto(sock, msg.c_str(), msg.length(), 0, (struct sockaddr*)&mcast_addr, sizeof(mcast_addr));
-    CLOSE_SOCKET(sock);
-}
-
 void start_bully_election(std::string my_id) {
     if (is_isolated) return;
-    current_state = ELECTION_MODE;
-    received_ok = false;
-    int my_score = calculate_priority();
+    current_state = ELECTION_MODE; received_ok = false; int my_score = calculate_priority();
     int jitter_ms = 5000 + (GET_PID() % 1000);
-    std::cout << "\033[1;33m[VOTE]\033[0m Détection SPOF. Élection dans " << jitter_ms << " ms (Score: " << my_score << ")\n";
+    std::cout << "\033[1;33m[VOTE]\033[0m Élection dans " << jitter_ms << " ms\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(jitter_ms));
-    std::string p2p_key = get_p2p_hmac_key();
-    broadcast_p2p(sign_message(p2p_key, "MSG_VOTE|" + my_id + "|" + std::to_string(my_score)));
-
+    if(!keep_running) return;
+    broadcast_bully_signed("MSG_VOTE", std::to_string(my_score));
     std::this_thread::sleep_for(std::chrono::seconds(5));
+    if(!keep_running) return;
+
     if (!received_ok && !is_isolated) {
-        current_state = COORDINATOR_MODE;
-        current_leader_id = my_id;
-        std::cout << "\033[1;45;37m [SYSTEME] JE SUIS LE NOUVEAU LEADER \033[0m\n";
-        broadcast_p2p(sign_message(p2p_key, "MSG_COORDINATOR|" + my_id));
-    } else {
-        current_state = NORMAL;
-    }
+        current_state = COORDINATOR_MODE; current_leader_id = my_id;
+        std::cout << "\033[1;45;37m [SYSTEME] NOUVEAU LEADER \033[0m\n";
+        broadcast_bully_signed("MSG_COORDINATOR", "");
+    } else { current_state = NORMAL; }
 }
-
-void listen_for_neighbors(std::string my_id) {
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-#else
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-#endif
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-#ifndef _WIN32
-    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (char*)&opt, sizeof(opt));
-#endif
-    struct sockaddr_in recv_addr;
-    recv_addr.sin_family = AF_INET;
-    recv_addr.sin_port = htons(P2P_MULTICAST_PORT);
-    recv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind(sock, (struct sockaddr*)&recv_addr, sizeof(recv_addr));
-
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = inet_addr(P2P_MULTICAST_IP);
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq));
-
-    std::string p2p_key = get_p2p_hmac_key();
-
-    while (true) {
-        char buffer[2048] = {0};
-        struct sockaddr_in sender_addr;
-#ifdef _WIN32
-        int sender_len = sizeof(sender_addr);
-#else
-        socklen_t sender_len = sizeof(sender_addr);
-#endif
-        int bytes = recvfrom(sock, buffer, sizeof(buffer)-1, 0, (struct sockaddr*)&sender_addr, &sender_len);
-        if (bytes <= 0 || is_isolated) continue;
-
-        std::string msg(buffer, bytes);
-        size_t last_pipe = msg.rfind('|');
-        if (last_pipe == std::string::npos) continue;
-        std::string content = msg.substr(0, last_pipe);
-        std::string received_hmac = msg.substr(last_pipe+1);
-        if (!verify_hmac(p2p_key, content, received_hmac)) continue;
-
-        size_t p1 = content.find('|');
-        if (p1 == std::string::npos) continue;
-        std::string type = content.substr(0, p1);
-        std::string sender_id;
-        if (type == "MSG_VOTE" || type == "MSG_OK" || type == "MSG_COORDINATOR") {
-            size_t p2 = content.find('|', p1+1);
-            if (p2 != std::string::npos) sender_id = content.substr(p1+1, p2-p1-1);
-            else sender_id = content.substr(p1+1);
-        }
-
-        if (!sender_id.empty() && sender_id != my_id) {
-            std::lock_guard<std::mutex> lock(mesh_mutex);
-            bool found = false;
-            for (auto& n : active_mesh) {
-                if (n.id == sender_id) {
-                    n.last_seen = time(nullptr);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                Neighbor nb;
-                nb.id = sender_id;
-                nb.ip = inet_ntoa(sender_addr.sin_addr);
-                nb.priority_score = 0;
-                nb.last_seen = time(nullptr);
-                active_mesh.push_back(nb);
-            }
-        }
-
-        if (type == "MSG_VOTE") {
-            size_t p2 = content.find('|', p1+1);
-            if (p2 == std::string::npos) continue;
-            sender_id = content.substr(p1+1, p2-p1-1);
-            int sender_score = std::stoi(content.substr(p2+1));
-            int my_score = calculate_priority();
-            if (sender_id != my_id) {
-                if (my_score > sender_score) {
-                    broadcast_p2p(sign_message(p2p_key, "MSG_OK|" + my_id));
-                    if (current_state != ELECTION_MODE) std::thread(start_bully_election, my_id).detach();
-                } else if (my_score < sender_score) {
-                    received_ok = true;
-                    current_state = NORMAL;
-                }
-            }
-        } else if (type == "MSG_OK") {
-            sender_id = content.substr(p1+1);
-            if (sender_id != my_id) received_ok = true;
-        } else if (type == "MSG_COORDINATOR") {
-            sender_id = content.substr(p1+1);
-            current_leader_id = sender_id;
-            if (current_leader_id != my_id) {
-                current_state = NORMAL;
-                std::cout << "\033[1;36m[MAILLAGE]\033[0m Nouveau chef accepté : " << current_leader_id << "\n";
-            }
-        }
-    }
-}
-
-// ============================================================
-// 5EME DIMENSION (Trafic sortant)
-// ============================================================
-#ifdef __linux__
-static unsigned long long get_total_tx_bytes() {
-    std::ifstream netdev("/proc/net/dev");
-    if (!netdev.is_open()) return 0;
-    std::string line;
-    unsigned long long total = 0;
-    std::getline(netdev, line);
-    std::getline(netdev, line);
-    while (std::getline(netdev, line)) {
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::string iface = line.substr(0, colon);
-        if (iface.find("lo") != std::string::npos) continue;
-        std::string stats = line.substr(colon + 1);
-        std::istringstream iss(stats);
-        unsigned long long rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo, rx_frame, rx_compressed, rx_multicast;
-        unsigned long long tx_bytes, tx_packets, tx_errs, tx_drop, tx_fifo, tx_colls, tx_carrier, tx_compressed;
-        iss >> rx_bytes >> rx_packets >> rx_errs >> rx_drop >> rx_fifo >> rx_frame >> rx_compressed >> rx_multicast
-            >> tx_bytes >> tx_packets >> tx_errs >> tx_drop >> tx_fifo >> tx_colls >> tx_carrier >> tx_compressed;
-        total += tx_bytes;
-    }
-    return total;
-}
-#else
-static unsigned long long get_total_tx_bytes() { return 0; }
-#endif
 
 std::string get_neighbors_list() {
     std::lock_guard<std::mutex> lock(mesh_mutex);
@@ -482,267 +675,306 @@ std::string get_neighbors_list() {
     return neighbors;
 }
 
-// ============================================================
-// TELEMETRY JSON (CORRIGÉ: INJECTION DU STATUT ISOLATION)
-// ============================================================
-std::string get_telemetry(const std::string& node_id) {
-    char hostname[HOST_NAME_MAX];
-    gethostname(hostname, HOST_NAME_MAX);
-    long usedRAM = 0; int procs = 0; double cpu_load = 0.0;
-#ifdef _WIN32
-    MEMORYSTATUSEX statex; statex.dwLength = sizeof(statex); GlobalMemoryStatusEx(&statex);
-    usedRAM = (statex.ullTotalPhys - statex.ullAvailPhys) / (1024 * 1024);
-    SYSTEM_INFO sysinfo; GetSystemInfo(&sysinfo); procs = sysinfo.dwNumberOfProcessors;
-#else
-    struct sysinfo memInfo; sysinfo(&memInfo);
-    long total = (memInfo.totalram * memInfo.mem_unit) / (1024 * 1024);
-    long free = (memInfo.freeram * memInfo.mem_unit) / (1024 * 1024);
-    usedRAM = total - free;
-    procs = memInfo.procs;
-    double loads[1];
-    if (getloadavg(loads, 1) != -1) cpu_load = loads[0];
+void listen_for_neighbors(std::string my_id) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int opt = 1; setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+#ifndef _WIN32
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (char*)&opt, sizeof(opt));
 #endif
+    struct sockaddr_in recv_addr; recv_addr.sin_family = AF_INET; recv_addr.sin_port = htons(P2P_MULTICAST_PORT); recv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(sock, (struct sockaddr*)&recv_addr, sizeof(recv_addr));
+    struct ip_mreq mreq; mreq.imr_multiaddr.s_addr = inet_addr(P2P_MULTICAST_IP); mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq));
 
-    static unsigned long long last_tx_bytes = 0;
-    static auto last_time = std::chrono::steady_clock::now();
-    unsigned long long current_tx = get_total_tx_bytes();
-    auto now = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(now - last_time).count();
-    long long net_out_bytes_s = 0;
-    if (last_tx_bytes != 0 && elapsed_sec > 0.0) {
-        long long diff = current_tx - last_tx_bytes;
-        if (diff >= 0) net_out_bytes_s = static_cast<long long>(diff / elapsed_sec);
-    }
-    last_tx_bytes = current_tx;
-    last_time = now;
+    int flags = fcntl(sock, F_GETFL, 0); fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-    std::string neighbors_list = get_neighbors_list();
-    std::string state_str = (current_state == COORDINATOR_MODE) ? "COORDINATOR" : "NORMAL";
-    std::string attack_status = honeypot_triggered ? "TRUE" : "FALSE";
+    std::map<std::string, std::pair<int, time_t>> token_bucket;
+    int cleanup_counter = 0;
 
-    json j;
-    j["ID"] = node_id;
-    j["HOST"] = hostname;
-    j["RAM_MB"] = usedRAM;
-    j["CPU_LOAD"] = cpu_load;
-    j["PROCS"] = procs;
-    j["STATE"] = state_str;
-    j["NET_OUT"] = net_out_bytes_s;
-    j["NEIGHBORS"] = neighbors_list;
-    j["ATTACK"] = attack_status;
-    
-    // 🔥 CORRECTION : Injection directe de l'état d'auto-isolation dans la télémétrie
-    if (is_isolated) {
-        j["STATUS"] = "SELF_ISOLATED";
-    }
-    
-    return j.dump();
-}
+    while (keep_running) {
+        cleanup_counter++;
+        if (cleanup_counter >= 1000) {
+            time_t now_sec = time(nullptr);
+            for (auto it = token_bucket.begin(); it != token_bucket.end(); ) {
+                if (now_sec - it->second.second > 60) it = token_bucket.erase(it);
+                else ++it;
+            }
+            cleanup_counter = 0;
+        }
 
-// ============================================================
-// SIGUSR1 HANDLER (ASYNC SAFE)
-// ============================================================
-void isolation_signal_handler(int) {
-    signal_pending = true;
-}
+        char buffer[65536] = {0}; struct sockaddr_in sender_addr; socklen_t sender_len = sizeof(sender_addr);
+        int bytes = recvfrom(sock, buffer, sizeof(buffer)-1, 0, (struct sockaddr*)&sender_addr, &sender_len);
+        if (bytes <= 0) { SLEEP_MS(100); continue; }
+        if (is_isolated) continue;
 
-// ============================================================
-// MASQUAGE (LINUX)
-// ============================================================
-void hide_process_name(int argc, char* argv[]) {
-#ifdef __linux__
-    if (argc > 0) {
-        char* p = argv[0];
-        size_t len = strlen(p);
-        const char* fake_name = "[kworker/u4:2]";
-        size_t fake_len = strlen(fake_name);
-        if (fake_len <= len) {
-            strcpy(p, fake_name);
-            for (size_t i = fake_len; i < len; ++i) p[i] = ' ';
+        std::string sender_ip = inet_ntoa(sender_addr.sin_addr);
+        std::string sender_key = sender_ip + ":" + std::to_string(ntohs(sender_addr.sin_port));
+        time_t now_sec = time(nullptr);
+        if (now_sec - token_bucket[sender_key].second > 0) {
+            token_bucket[sender_key] = {50, now_sec};
+        } else {
+            if (token_bucket[sender_key].first <= 0) continue;
+            token_bucket[sender_key].first--;
+        }
+
+        std::string msg(buffer, bytes);
+
+        if (msg.rfind("BULLY:", 0) == 0) {
+            try {
+                std::string content = msg.substr(6);
+                size_t last_pipe = content.rfind('|'); if (last_pipe == std::string::npos) continue;
+                std::string signed_part = content.substr(0, last_pipe);
+                std::string sig = base64_decode(content.substr(last_pipe + 1));
+
+                std::vector<std::string> parts; size_t pos = 0;
+                while (pos < signed_part.size()) {
+                    size_t pipe = signed_part.find('|', pos);
+                    if (pipe == std::string::npos) { parts.push_back(signed_part.substr(pos)); break; }
+                    parts.push_back(signed_part.substr(pos, pipe - pos)); pos = pipe + 1;
+                }
+                if (parts.size() != 5) continue;
+
+                std::string type = parts[0], sender = parts[1], payload = parts[2], pk_b64 = parts[4];
+                uint64_t msg_ts = std::stoull(parts[3]);
+                uint64_t now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                if (std::abs((long long)now_ts - (long long)msg_ts) > MSG_TIMESTAMP_TTL_SEC) continue;
+
+                bool sig_ok = false;
+                {
+                    std::lock_guard<std::mutex> peer_lock(pbft::peers_mutex);
+                    if (pbft::known_peers.find(sender) == pbft::known_peers.end()) {
+                        std::string pem = base64_decode(pk_b64);
+                        EVP_PKEY* pub = pbft::pem_to_pubkey(pem);
+                        if (pub) pbft::known_peers[sender] = {sender, pub, time(nullptr)};
+                    } else {
+                        pbft::known_peers[sender].last_seen = time(nullptr);
+                    }
+                    auto it = pbft::known_peers.find(sender);
+                    if (it != pbft::known_peers.end()) {
+                        std::lock_guard<std::mutex> crypto_lock(pbft::crypto_mutex);
+                        sig_ok = pbft::verify_sig(it->second.pubkey, signed_part, sig);
+                    }
+                }
+                if (!sig_ok) continue;
+
+                if (type == "MSG_VOTE" && sender != my_id) {
+                    int sender_score = std::stoi(payload);
+                    int my_score = calculate_priority();
+                    if (my_score > sender_score) {
+                        broadcast_bully_signed("MSG_OK", "");
+                        if (current_state != ELECTION_MODE) std::thread(start_bully_election, my_id).detach();
+                    } else if (my_score < sender_score) { received_ok = true; current_state = NORMAL; }
+                } else if (type == "MSG_OK" && sender != my_id) { received_ok = true;
+                } else if (type == "MSG_COORDINATOR" && sender != my_id) {
+                    current_leader_id = sender; current_state = NORMAL;
+                }
+            } catch (...) { continue; }
+        }
+
+        if (msg.rfind("PBFT:", 0) == 0) {
+            try {
+                json pbft_msg = json::parse(msg.substr(5));
+                if (pbft_msg.contains("type") && pbft_msg["type"] == (int)pbft::HEARTBEAT) {
+                    std::string node_id = pbft_msg["node_id"];
+                    if (node_id != my_id) {
+                        std::lock_guard<std::mutex> plock(pbft::peers_mutex);
+                        if (pbft::known_peers.find(node_id) == pbft::known_peers.end()) {
+                            EVP_PKEY* pub = pbft::pem_to_pubkey(pbft_msg["pubkey"]);
+                            if (pub) pbft::known_peers[node_id] = {node_id, pub, time(nullptr)};
+                        } else { pbft::known_peers[node_id].last_seen = time(nullptr); }
+                        
+                        std::lock_guard<std::mutex> mlock(mesh_mutex);
+                        bool found_m = false;
+                        for (auto& n : active_mesh) { if (n.id == node_id) { n.last_seen = time(nullptr); found_m = true; break; } }
+                        if (!found_m) active_mesh.push_back({node_id, "P2P", 0, time(nullptr)});
+                    }
+                } else { handle_pbft_message(pbft_msg); }
+            } catch (...) {}
         }
     }
-#else
-    (void)argc; (void)argv;
-#endif
+    CLOSE_SOCKET(sock);
 }
 
-// ============================================================
-// MAIN LOOP
-// ============================================================
-int main(int argc, char* argv[]) {
-    hide_process_name(argc, argv);
+std::string websocket_accept_key(const std::string& key) {
+    std::string magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string combined = key + magic; unsigned char sha[20];
+    SHA1((const unsigned char*)combined.c_str(), combined.size(), sha);
+    return base64_encode(sha, 20);
+}
 
+void ws_send(int fd, const std::string& message) {
+    std::vector<unsigned char> frame;
+    frame.push_back(0x81);
+    size_t len = message.size();
+    if (len <= 125) { frame.push_back(len); } 
+    else if (len <= 65535) { frame.push_back(126); frame.push_back((len >> 8) & 0xFF); frame.push_back(len & 0xFF); } 
+    else { frame.push_back(127); for (int i = 7; i >= 0; i--) frame.push_back((len >> (i * 8)) & 0xFF); }
+    frame.insert(frame.end(), message.begin(), message.end());
+    send(fd, (char*)frame.data(), frame.size(), MSG_NOSIGNAL);
+}
+
+void ws_broadcast(const std::string& state) {
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    for (int fd : ws_clients) ws_send(fd, state);
+}
+
+void update_json_state(const std::string& id, const std::string& host, long ram, double cpu, int p, long l,
+                       long long net_tx, long long net_rx, long long d_io, long p_c, long f_r, const std::string& neigh) {
+    json j; j["architecture"] = "NEURO-MESH (PBFT, IA 7D)"; j["system_status"] = is_isolated ? "THREAT" : "ONLINE";
+    j["active_nodes"] = json::array(); json n; n["id"] = id; n["hostname"] = host; n["ram_mb"] = ram; n["cpu_load"] = cpu;
+    n["procs"] = p_c; n["net_tx_bs"] = net_tx; n["net_rx_bs"] = net_rx; n["disk_io_bs"] = d_io; n["file_rate"] = f_r;
+    n["neighbors"] = neigh; n["status"] = is_isolated ? "COMPROMIS" : "STABLE";
+    if (is_isolated) n["STATUS"] = "SELF_ISOLATED";
+    n["p2p_state"] = (current_state == COORDINATOR_MODE) ? "COORDINATOR" : "NORMAL";
+    j["active_nodes"].push_back(n); j["logs"] = json::array();
+    std::string s = j.dump();
+    std::lock_guard<std::mutex> lock(json_mutex); current_json_state = s; ws_broadcast(s);
+}
+
+void isolation_signal_handler(int) { signal_pending = true; }
+void graceful_shutdown_handler(int) { keep_running = false; std::cout << "\n\033[1;33m[SYSTEME]\033[0m Arrêt gracieux...\n"; }
+int recv_full(int sock, char* buffer, size_t total_len, int flags) {
+    size_t r = 0; while (r < total_len) { int res = recv(sock, buffer + r, total_len - r, flags); if (res <= 0) return -1; r += res; }
+    return (int)r;
+}
+
+int main(int argc, char* argv[]) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, isolation_signal_handler);
+    signal(SIGINT, graceful_shutdown_handler);
+    signal(SIGTERM, graceful_shutdown_handler);
 #endif
+    OpenSSL_add_all_algorithms(); srand(time(nullptr));
 
-    std::cout << "\033[1;36m[SYSTEME]\033[0m Initialisation de l'architecture polymorphique...\n";
-    srand(time(nullptr));
-
-#ifdef _WIN32
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
+    try { init_system_metrics(); init_p2p_socket(); } 
+    catch (const std::exception& e) { return EXIT_FAILURE; }
 
     std::string auto_id = "NODE_" + std::to_string(GET_PID());
-    std::string secret_msg("\x11\x16\x03\x0c\x06\x00\x1b", 7);
-    std::cout << "\033[1;36m[SYSTEME]\033[0m Agent " << auto_id << " prêt. Statut initial : " << neuro_decrypt(secret_msg) << std::endl;
+    pbft_init_identity(auto_id);
 
     std::thread(tarpit_honeypot).detach();
     std::thread(listen_for_neighbors, auto_id).detach();
 
-    int backoff_ms = 1000;
-    while (true) {
-#ifdef _WIN32
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-#else
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-#endif
-        if (sock < 0) {
-            SLEEP_MS(backoff_ms);
-            backoff_ms = std::min(backoff_ms * 2, MAX_BACKOFF_MS);
-            continue;
-        }
+    std::thread([]() { while (keep_running) { if (!is_isolated) pbft_broadcast_heartbeat(); SLEEP_MS(5000); } }).detach();
+    std::thread([]() { while (keep_running) { pbft_cleanup_and_retransmit(); SLEEP_MS(1000); } }).detach();
 
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
-
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(C2_PORT);
-        const char* c2_addr = std::getenv("NEURO_MESH_C2_ADDR");
-        if (c2_addr == nullptr) c2_addr = "127.0.0.1";
-        inet_pton(AF_INET, c2_addr, &serv_addr.sin_addr);
-
-        if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            CLOSE_SOCKET(sock);
-            std::cout << "\033[1;31m[!]\033[0m C2 injoignable, reconnexion dans " << backoff_ms << " ms\n";
-            if (current_state == NORMAL && !is_isolated) {
-                std::thread(start_bully_election, auto_id).detach();
-            }
-            SLEEP_MS(backoff_ms);
-            backoff_ms = std::min(backoff_ms * 2, MAX_BACKOFF_MS);
-            continue;
-        }
-
-        backoff_ms = 1000;
-
-        // 1. RSA Handshake
-        char pub_key_buffer[4096] = {0};
-        int pk_len = recv(sock, pub_key_buffer, sizeof(pub_key_buffer)-1, 0);
-        if (pk_len <= 0) { CLOSE_SOCKET(sock); continue; }
-        
-        BIO* bio = BIO_new_mem_buf(pub_key_buffer, pk_len);
-        EVP_PKEY* pub_key = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
-        BIO_free(bio);
-        if (!pub_key) { CLOSE_SOCKET(sock); continue; }
-
-        unsigned char aes_key[AES_KEY_LEN];
-        unsigned char iv_handshake[AES_GCM_IV_LEN];
-        RAND_bytes(aes_key, AES_KEY_LEN);
-        RAND_bytes(iv_handshake, AES_GCM_IV_LEN);
-        
-        unsigned char session_material[SESSION_MATERIAL_LEN];
-        memcpy(session_material, aes_key, AES_KEY_LEN);
-        memcpy(session_material + AES_KEY_LEN, iv_handshake, AES_GCM_IV_LEN);
-
-        std::string encrypted_session = rsa_encrypt(pub_key, session_material, SESSION_MATERIAL_LEN);
-        EVP_PKEY_free(pub_key);
-        if (encrypted_session.empty() || encrypted_session.size() != RSA_ENCRYPTED_LEN) { CLOSE_SOCKET(sock); continue; }
-        if (send(sock, encrypted_session.c_str(), RSA_ENCRYPTED_LEN, 0) != RSA_ENCRYPTED_LEN) { CLOSE_SOCKET(sock); continue; }
-
-        memcpy(session_key, aes_key, AES_KEY_LEN);
-        hmac_key = get_p2p_hmac_key();
-
-        // 2. Auth GCM
-        std::string auth_token = "AUTH:" + std::string(AGENT_AUTH_TOKEN);
-        unsigned char iv_auth[AES_GCM_IV_LEN];
-        std::string encrypted_auth = encrypt_aes256_gcm(auth_token, session_key, iv_auth);
-        uint32_t auth_len = htonl(encrypted_auth.size());
-        send(sock, &auth_len, 4, 0);
-        send(sock, encrypted_auth.c_str(), encrypted_auth.size(), 0);
-
-        SLEEP_MS(200);
-
-        // 3. Boucle Télémétrie Stricte (Ping-Pong TCP garanti)
-        while (true) {
-            // Gestion d'un signal SIGUSR1
+    std::thread([auto_id]() {
+        while (keep_running) {
             if (signal_pending) {
                 signal_pending = false;
-                std::cout << "\033[1;41;37m[SIGNAL] Isolation forcée reçue ! Passage en mode quarantaine.\033[0m" << std::endl;
+                std::cout << "\033[1;41;37m[SIGNAL] Isolation forcée reçue !\033[0m\n";
                 is_isolated = true;
-                report_interval = 1000;
-                current_state = NORMAL;
-
-                // On n'envoie PLUS de paquet manuellement ici. 
-                // Le statut SELF_ISOLATED est maintenant capturé proprement par get_telemetry() ci-dessous.
-                
-                // Trace locale optionnelle pour le C2 s'il lit les fichiers (fallback)
-                std::ofstream cmd_file(IA_CMD_FILE, std::ios::app);
-                if (cmd_file.is_open()) {
-                    cmd_file << "CMD_IA:ISOLATE|" << auto_id << std::endl;
-                    cmd_file.close();
-                }
+                pbft_propose_isolation(auto_id);
             }
 
-            std::string fresh_data = get_telemetry(auto_id);
-            unsigned char iv_msg[AES_GCM_IV_LEN];
-            std::string encrypted_payload = encrypt_aes256_gcm(fresh_data, session_key, iv_msg);
-            uint32_t msg_len = htonl(encrypted_payload.size());
-            if (send(sock, &msg_len, 4, 0) != 4 ||
-                send(sock, encrypted_payload.c_str(), encrypted_payload.size(), 0) != (ssize_t)encrypted_payload.size()) {
-                break; // Erreur d'envoi, on drop et on recommence
+            long r, p_c, f_r; double c; long long tx, rx, d_io;
+            collect_local_metrics(r, c, tx, rx, d_io, p_c, f_r);
+            update_ia_history(r, c, tx, rx, d_io, p_c, f_r);
+
+            if (ia_check_anomaly(r, c, tx, rx, d_io, p_c, f_r) && !is_isolated) {
+                std::cout << "\033[1;41;37m[IA DISTRIBUÉE]\033[0m Anomalie !\n";
+                pbft_propose_isolation(auto_id);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            char host[256]; gethostname(host, 256);
+            update_json_state(auto_id, host, r, c, 1, 0, tx, rx, d_io, p_c, f_r, get_neighbors_list());
+            
+            int ia_sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (ia_sock >= 0) {
+                struct sockaddr_in ia_addr;
+                ia_addr.sin_family = AF_INET;
+                ia_addr.sin_port = htons(9998);
+                inet_pton(AF_INET, "127.0.0.1", &ia_addr.sin_addr);
+                std::string t_data = get_telemetry(auto_id);
+                std::string payload = "TELEMETRY:" + t_data;
+                sendto(ia_sock, payload.c_str(), payload.length(), 0, (struct sockaddr*)&ia_addr, sizeof(ia_addr));
+                close(ia_sock);
             }
 
-            uint32_t cmd_len;
-            if (recv_full(sock, (char*)&cmd_len, 4) != 4) break;
-            cmd_len = ntohl(cmd_len);
-            if (cmd_len == 0 || cmd_len > 65536) break;
-            
-            std::vector<char> cmd_buf(cmd_len);
-            if (recv_full(sock, cmd_buf.data(), cmd_len) != (int)cmd_len) break;
-            
-            std::string decrypted_cmd = decrypt_aes256_gcm((unsigned char*)cmd_buf.data(), cmd_len, session_key);
-            
-            // Ignorer silencieusement un paquet altéré
-            if (decrypted_cmd == "ERREUR") {
-                SLEEP_MS(report_interval.load());
-                continue;
-            }
-
-            std::string cmd_part = decrypted_cmd;
-            size_t pipe_pos = decrypted_cmd.find('|');
-            if (pipe_pos != std::string::npos) cmd_part = decrypted_cmd.substr(0, pipe_pos);
-
-            if (cmd_part == "CMD:STANDBY") {
-                if (!is_isolated)
-                    std::cout << "\033[1;34m[FLUX]\033[0m Télémétrie OK | \033[1;32mSTANDBY\033[0m" << std::endl;
-            } else if (cmd_part == "CMD:ISOLATE_NETWORK") {
-                if (!is_isolated) {
-                    std::cout << "\033[1;41;37m [STATUT : ISOLATION ATOMIQUE ACTIVE] \033[0m" << std::endl;
-                    std::cout << "\033[1;33m[SEC]\033[0m Maillage P2P suspendu. Mode 'Quarantaine'.\n";
-                    is_isolated = true;
-                    report_interval = 1000;
-                    current_state = NORMAL;
-                }
-            } else if (cmd_part == "CMD:GLOBAL_ALERT") {
-                if (!is_isolated) {
-                    std::cout << "\033[1;33m[SAGESSE COLLECTIVE]\033[0m Alerte réseau reçue ! Boucliers P2P renforcés.\n";
-                    report_interval = 3000;
-                }
-            }
-            
             SLEEP_MS(report_interval.load());
         }
-        CLOSE_SOCKET(sock);
+    }).detach();
+
+    while (keep_running) {
+        int backoff = 1000; bool c2_connected = false;
+        while (keep_running) {
+            if (c2_connected) { SLEEP_MS(backoff); backoff = std::min(backoff * 2, MAX_BACKOFF_MS); c2_connected = false; }
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) { SLEEP_MS(backoff); backoff = std::min(backoff * 2, MAX_BACKOFF_MS); continue; }
+
+            struct sockaddr_in serv; serv.sin_family = AF_INET; serv.sin_port = htons(C2_PORT);
+            inet_pton(AF_INET, "127.0.0.1", &serv.sin_addr);
+
+            if (connect(sock, (struct sockaddr*)&serv, sizeof(serv)) < 0) {
+                CLOSE_SOCKET(sock); SLEEP_MS(backoff); backoff = std::min(backoff * 2, MAX_BACKOFF_MS); continue;
+            }
+
+            char pk_b[4096]; int pk_l = recv(sock, pk_b, 4095, 0);
+            if (pk_l <= 0) { CLOSE_SOCKET(sock); continue; }
+            BIO* bio = BIO_new_mem_buf(pk_b, pk_l); EVP_PKEY* pk = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr); BIO_free(bio);
+
+            unsigned char aes[32]; RAND_bytes(aes, 32); unsigned char iv[12]; RAND_bytes(iv, 12);
+            unsigned char mat[44]; memcpy(mat, aes, 32); memcpy(mat+32, iv, 12);
+            std::string enc_mat = rsa_encrypt(pk, mat, 44); EVP_PKEY_free(pk);
+            if (send(sock, enc_mat.c_str(), 256, 0) != 256) { CLOSE_SOCKET(sock); continue; }
+
+            memcpy(session_key, aes, 32);
+            std::string auth = encrypt_aes256_gcm("AUTH:" + std::string(AGENT_AUTH_TOKEN), session_key, iv);
+            uint32_t al = htonl(auth.size()); send(sock, &al, 4, 0); send(sock, auth.c_str(), auth.size(), 0);
+            SLEEP_MS(200); c2_connected = true;
+
+            while (c2_connected && keep_running) {
+                std::string data = get_telemetry(auto_id);
+                unsigned char iv_m[12]; std::string enc = encrypt_aes256_gcm(data, session_key, iv_m);
+                uint32_t ml = htonl(enc.size());
+
+                if (send(sock, &ml, 4, 0) != 4 || send(sock, enc.c_str(), enc.size(), 0) != (int)enc.size()) break;
+
+                fd_set read_fds; FD_ZERO(&read_fds); FD_SET(sock, &read_fds);
+                struct timeval timeout; timeout.tv_sec = 0; timeout.tv_usec = 100000;
+
+                int sel_res = select(sock + 1, &read_fds, nullptr, nullptr, &timeout);
+                if (sel_res > 0) {
+                    uint32_t cl; int r = recv_full(sock, (char*)&cl, 4);
+                    if (r == 4) {
+                        cl = ntohl(cl); std::vector<char> cb(cl);
+                        if (recv_full(sock, cb.data(), cl) != (int)cl) break;
+
+                        std::string decrypted_cmd = decrypt_aes256_gcm((unsigned char*)cb.data(), cl, session_key);
+                        if (decrypted_cmd != "ERREUR") {
+                            std::string cmd_part = decrypted_cmd;
+                            size_t pipe_pos = decrypted_cmd.find('|');
+                            if (pipe_pos != std::string::npos) cmd_part = decrypted_cmd.substr(0, pipe_pos);
+
+                            if (cmd_part == "CMD:REJOIN" && is_isolated) {
+                                std::cout << "\033[1;32m[GUÉRISON]\033[0m Ordre de réintégration reçu.\n";
+                                is_isolated = false; honeypot_triggered = false;
+                                report_interval = 5000; current_state = NORMAL;
+                            }
+                        }
+                    } else if (r <= 0) { break; }
+                } else if (sel_res < 0) { break; }
+
+                SLEEP_MS(report_interval.load());
+            }
+            CLOSE_SOCKET(sock);
+        }
     }
 
-#ifdef _WIN32
-    WSACleanup();
-#endif
+    if (g_udp_send_sock >= 0) CLOSE_SOCKET(g_udp_send_sock);
     return 0;
+}
+
+std::string get_telemetry(const std::string& id) {
+    long r, p_c, f_r; double c; long long tx, rx, d_io;
+    collect_local_metrics(r, c, tx, rx, d_io, p_c, f_r);
+    char host[256]; gethostname(host, 256);
+    json j; j["ID"] = id; j["HOST"] = host; j["RAM_MB"] = r; j["CPU_LOAD"] = c; j["PROCS"] = p_c;
+    j["NET_OUT"] = tx; j["NET_RX"] = rx; j["DISK_IO"] = d_io; j["FILE_RATE"] = f_r;
+    j["NEIGHBORS"] = get_neighbors_list();
+    if (is_isolated.load()) j["STATUS"] = "SELF_ISOLATED";
+    j["ATTACK"] = honeypot_triggered.load() ? "TRUE" : "FALSE";
+    j["STATE"] = (current_state == COORDINATOR_MODE) ? "COORDINATOR" : "NORMAL";
+    return j.dump();
 }
