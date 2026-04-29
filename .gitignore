@@ -14,3 +14,7 @@ neuro-mesh-env/
 node_modules/
 __pycache__/
 *.joblib
+neuro-mesh-env/
+node_modules/
+__pycache__/
+*.joblib
