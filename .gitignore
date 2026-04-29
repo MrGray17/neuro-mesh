@@ -10,3 +10,7 @@ sentry
 *.o
 *.swp
 *~
+neuro-mesh-env/
+node_modules/
+__pycache__/
+*.joblib
