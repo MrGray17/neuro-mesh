@@ -91,8 +91,7 @@ void pbft_cleanup_and_retransmit();
 #define WS_PORT             (8082 + (GET_PID() % 1000))
 #define MAX_BACKOFF_MS      60000
 #define IA_CMD_FILE         "ia_commands.txt"
-#define MAX_HONEYPOT_THREADS 50
-#define AGENT_AUTH_TOKEN    "NEURO_MESH_SECRET"
+#define MAX_HONEYPOT_CONNECTIONS 1000
 
 #define IA_HISTORY_LIMIT    50
 #define IA_LEARNING_WARMUP  5
@@ -123,6 +122,55 @@ std::unique_ptr<std::ifstream> g_diskstats;
 std::unique_ptr<std::ifstream> g_filenr;
 std::unique_ptr<std::ifstream> g_proc_stat;
 #endif
+
+// ============================================================
+// INFRASTRUCTURE: SECRETS MANAGEMENT (Fail Fast Pattern)
+// ============================================================
+std::string get_agent_auth_token() {
+    const char* env_token = std::getenv("NEURO_MESH_SECRET");
+    if (!env_token || std::strlen(env_token) == 0) {
+        std::cerr << "\033[1;41;37m[FATAL] NEURO_MESH_SECRET environment variable is missing!\033[0m\n";
+        std::cerr << "Export it before running: export NEURO_MESH_SECRET='your_secret'\n";
+        exit(EXIT_FAILURE);
+    }
+    return std::string(env_token);
+}
+
+// ============================================================
+// INFRASTRUCTURE: TELEMETRY EMITTER (RAII Pattern)
+// ============================================================
+class LocalTelemetryEmitter {
+private:
+    int m_sock{-1};
+    struct sockaddr_in m_ia_addr{};
+
+public:
+    LocalTelemetryEmitter(const LocalTelemetryEmitter&) = delete;
+    LocalTelemetryEmitter& operator=(const LocalTelemetryEmitter&) = delete;
+
+    LocalTelemetryEmitter(const std::string& ip, uint16_t port) {
+        m_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (m_sock < 0) {
+            throw std::runtime_error("[FATAL] Failed to initialize telemetry socket. FD limit reached?");
+        }
+        m_ia_addr.sin_family = AF_INET;
+        m_ia_addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip.c_str(), &m_ia_addr.sin_addr);
+    }
+
+    ~LocalTelemetryEmitter() {
+        if (m_sock >= 0) {
+            CLOSE_SOCKET(m_sock);
+        }
+    }
+
+    void emit(const std::string& payload) const noexcept {
+        if (m_sock >= 0) {
+            sendto(m_sock, payload.c_str(), payload.length(), 0, 
+                   (struct sockaddr*)&m_ia_addr, sizeof(m_ia_addr));
+        }
+    }
+};
 
 void init_system_metrics() {
 #ifdef __linux__
@@ -295,7 +343,7 @@ std::string data_to_sign(pbft::PBFType type, uint64_t view, uint64_t seq, const 
 void pbft_init_identity(const std::string& node_id) {
     pbft::my_identity.node_id = node_id;
     pbft::my_identity.privkey = pbft::generate_ed25519_key();
-    if (!pbft::my_identity.privkey) { std::cerr << "Erreur clé Ed25519\n"; exit(1); }
+    if (!pbft::my_identity.privkey) { std::cerr << "Erreur cl├® Ed25519\n"; exit(1); }
     pbft::my_identity.pubkey_pem = pbft::pubkey_to_pem(pbft::my_identity.privkey);
 }
 
@@ -411,7 +459,7 @@ void handle_pbft_message(const json& msg) {
                         if (inst.commit_votes.size() >= quorum && !inst.decided) {
                             inst.decided = true; inst.decision_value = true;
                             if (inst.proposal.find("ISOLATE:" + pbft::my_identity.node_id) == 0 && !is_isolated) {
-                                std::cout << "\033[1;41;37m[PBFT] Auto-isolation confirmée!\033[0m\n";
+                                std::cout << "\033[1;41;37m[PBFT] Auto-isolation confirm├®e!\033[0m\n";
                                 is_isolated = true; report_interval = 1000; current_state = NORMAL;
                             }
                         }
@@ -452,7 +500,11 @@ void pbft_cleanup_and_retransmit() {
         std::lock_guard<std::mutex> peer_lock(pbft::peers_mutex);
         time_t now = time(nullptr);
         for (auto it = pbft::known_peers.begin(); it != pbft::known_peers.end(); ) {
-            if (now - it->second.last_seen > 30) { EVP_PKEY_free(it->second.pubkey); it = pbft::known_peers.erase(it); }
+            // FIX: PBFT Tombstoning - Retain peers longer (300s) to survive partitions
+            if (now - it->second.last_seen > 300) { 
+                EVP_PKEY_free(it->second.pubkey); 
+                it = pbft::known_peers.erase(it); 
+            }
             else { ++it; }
         }
     }
@@ -509,38 +561,78 @@ std::string rsa_encrypt(EVP_PKEY* pub_key, const unsigned char* data, size_t dat
     return result;
 }
 
-void tarpit_handler(int client_socket) {
-    const char* banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2\r\n";
-    send(client_socket, banner, strlen(banner), 0);
-    int max_ticks = 300;
-    while (max_ticks-- > 0 && keep_running) {
-        char poison[1024]; for (int i = 0; i < 1024; ++i) poison[i] = rand() % 256;
-        if (send(client_socket, poison, 1024, 0) <= 0) break;
-        SLEEP_MS(is_isolated ? 100 : 2000);
-    }
-    CLOSE_SOCKET(client_socket); active_honeypot_threads--;
-}
-
+// ============================================================
+// INFRASTRUCTURE: ASYNC HONEYPOT (poll-based Event Loop)
+// ============================================================
 void tarpit_honeypot() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     struct sockaddr_in address; address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY;
     int port = 2222; address.sin_port = htons(port);
-    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { port++; address.sin_port = htons(port); if (port > 2250) return; }
-    listen(server_fd, 10);
+    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { 
+        port++; address.sin_port = htons(port); 
+        if (port > 2250) return; 
+    }
+    listen(server_fd, 100);
 
     int flags = fcntl(server_fd, F_GETFL, 0); fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
-    while (keep_running) {
-        struct sockaddr_in client_addr; socklen_t addrlen = sizeof(client_addr);
-        int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
-        if (client_socket < 0) { SLEEP_MS(500); continue; }
+    std::vector<struct pollfd> fds;
+    fds.push_back({server_fd, POLLIN, 0});
+    std::map<int, int> client_ticks; 
 
-        if (active_honeypot_threads >= MAX_HONEYPOT_THREADS) { CLOSE_SOCKET(client_socket); continue; }
-        honeypot_triggered = true; active_honeypot_threads++;
-        std::thread([client_socket]() { tarpit_handler(client_socket); }).detach();
+    const char* banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2\r\n";
+
+    while (keep_running) {
+        int ret = poll(fds.data(), fds.size(), 2000); 
+        if (ret < 0) break;
+
+        if (fds[0].revents & POLLIN) {
+            struct sockaddr_in client_addr; socklen_t addrlen = sizeof(client_addr);
+            int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+            if (client_socket >= 0) {
+                if (fds.size() < MAX_HONEYPOT_CONNECTIONS) { 
+                    int cflags = fcntl(client_socket, F_GETFL, 0); 
+                    fcntl(client_socket, F_SETFL, cflags | O_NONBLOCK);
+                    send(client_socket, banner, strlen(banner), 0);
+                    fds.push_back({client_socket, POLLOUT, 0});
+                    client_ticks[client_socket] = 300;
+                    honeypot_triggered = true;
+                } else {
+                    CLOSE_SOCKET(client_socket);
+                }
+            }
+        }
+
+        for (size_t i = 1; i < fds.size(); ) {
+            int fd = fds[i].fd;
+            bool remove_fd = false;
+
+            if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                remove_fd = true;
+            } else if (fds[i].revents & POLLOUT) {
+                char poison[16]; for (int j = 0; j < 16; ++j) poison[j] = rand() % 256;
+                int sent = send(fd, poison, 16, 0);
+                if (sent <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    remove_fd = true;
+                } else {
+                    client_ticks[fd]--;
+                    if (client_ticks[fd] <= 0) remove_fd = true;
+                }
+            }
+
+            if (remove_fd) {
+                CLOSE_SOCKET(fd);
+                client_ticks.erase(fd);
+                fds.erase(fds.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+        active_honeypot_threads = fds.size() - 1; 
     }
-    CLOSE_SOCKET(server_fd);
+    
+    for (auto& pfd : fds) CLOSE_SOCKET(pfd.fd);
 }
 
 void collect_local_metrics(long& ram, double& cpu, long long& net_tx, long long& net_rx,
@@ -550,9 +642,8 @@ void collect_local_metrics(long& ram, double& cpu, long long& net_tx, long long&
     ram = (memInfo.totalram - memInfo.freeram) / (1024 * 1024);
     double loads[1]; cpu = (getloadavg(loads, 1) != -1) ? loads[0] : 0.0;
 
-    // 🔥 FIX CPU MATH : Lecture directe des coeurs physiques/logiques du processeur
     proc_count = std::thread::hardware_concurrency();
-    if (proc_count == 0) proc_count = 1; // Fallback par sécurité
+    if (proc_count == 0) proc_count = 1; 
 
     file_rate = 0;
     if (g_filenr && g_filenr->is_open()) { g_filenr->clear(); g_filenr->seekg(0); long a, b, c; (*g_filenr) >> a >> b >> c; file_rate = a; }
@@ -611,8 +702,9 @@ bool ia_check_anomaly(long ram, double cpu, long long net_tx, long long net_rx,
     if (!ia_warmup_done || running_count < 2) return false;
     double cur[7] = {(double)ram, cpu, (double)net_tx, (double)net_rx, (double)disk_io, (double)proc_count, (double)file_rate};
     for (int i = 0; i < 7; i++) {
-        double stddev = std::sqrt(running_M2[i] / (running_count - 1));
-        if (stddev == 0) continue;
+        // FIX: Clamp standard deviation to prevent massive z-scores on idle systems
+        double stddev = std::max(std::sqrt(running_M2[i] / (running_count - 1)), 0.001);
+        
         bool increase_only = (i == 0 || i == 1 || i == 2 || i == 4);
         if (increase_only) {
             if (cur[i] > running_mean[i] && ((cur[i] - running_mean[i]) / stddev) > IA_ZSCORE_THRESHOLD) return true;
@@ -651,7 +743,7 @@ void start_bully_election(std::string my_id) {
     if (is_isolated) return;
     current_state = ELECTION_MODE; received_ok = false; int my_score = calculate_priority();
     int jitter_ms = 5000 + (GET_PID() % 1000);
-    std::cout << "\033[1;33m[VOTE]\033[0m Élection dans " << jitter_ms << " ms\n";
+    std::cout << "\033[1;33m[VOTE]\033[0m ├ëlection dans " << jitter_ms << " ms\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(jitter_ms));
     if(!keep_running) return;
     broadcast_bully_signed("MSG_VOTE", std::to_string(my_score));
@@ -820,6 +912,8 @@ void ws_broadcast(const std::string& state) {
 
 void update_json_state(const std::string& id, const std::string& host, long ram, double cpu, int p, long l,
                        long long net_tx, long long net_rx, long long d_io, long p_c, long f_r, const std::string& neigh) {
+    (void)p;
+    (void)l;
     json j; j["architecture"] = "NEURO-MESH (PBFT, IA 7D)"; j["system_status"] = is_isolated ? "THREAT" : "ONLINE";
     j["active_nodes"] = json::array(); json n; n["id"] = id; n["hostname"] = host; n["ram_mb"] = ram; n["cpu_load"] = cpu;
     n["procs"] = p_c; n["net_tx_bs"] = net_tx; n["net_rx_bs"] = net_rx; n["disk_io_bs"] = d_io; n["file_rate"] = f_r;
@@ -832,13 +926,15 @@ void update_json_state(const std::string& id, const std::string& host, long ram,
 }
 
 void isolation_signal_handler(int) { signal_pending = true; }
-void graceful_shutdown_handler(int) { keep_running = false; std::cout << "\n\033[1;33m[SYSTEME]\033[0m Arrêt gracieux...\n"; }
+void graceful_shutdown_handler(int) { keep_running = false; std::cout << "\n\033[1;33m[SYSTEME]\033[0m Arr├¬t gracieux...\n"; }
 int recv_full(int sock, char* buffer, size_t total_len, int flags) {
     size_t r = 0; while (r < total_len) { int res = recv(sock, buffer + r, total_len - r, flags); if (res <= 0) return -1; r += res; }
     return (int)r;
 }
 
 int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, isolation_signal_handler);
@@ -860,10 +956,20 @@ int main(int argc, char* argv[]) {
     std::thread([]() { while (keep_running) { pbft_cleanup_and_retransmit(); SLEEP_MS(1000); } }).detach();
 
     std::thread([auto_id]() {
+        // FIX: RAII socket initialization, fail fast, prevents fd leak
+        std::unique_ptr<LocalTelemetryEmitter> telemetry_emitter;
+        try {
+            telemetry_emitter = std::make_unique<LocalTelemetryEmitter>("127.0.0.1", 9998);
+        } catch (const std::exception& e) {
+            std::cerr << "\033[1;41;37m" << e.what() << "\033[0m\n";
+            keep_running = false;
+            return;
+        }
+
         while (keep_running) {
             if (signal_pending) {
                 signal_pending = false;
-                std::cout << "\033[1;41;37m[SIGNAL] Isolation forcée reçue !\033[0m\n";
+                std::cout << "\033[1;41;37m[SIGNAL] Isolation forc├®e re├ºue !\033[0m\n";
                 is_isolated = true;
                 pbft_propose_isolation(auto_id);
             }
@@ -873,28 +979,23 @@ int main(int argc, char* argv[]) {
             update_ia_history(r, c, tx, rx, d_io, p_c, f_r);
 
             if (ia_check_anomaly(r, c, tx, rx, d_io, p_c, f_r) && !is_isolated) {
-                std::cout << "\033[1;41;37m[IA DISTRIBUÉE]\033[0m Anomalie !\n";
+                std::cout << "\033[1;41;37m[IA DISTRIBU├ëE]\033[0m Anomalie !\n";
                 pbft_propose_isolation(auto_id);
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
             char host[256]; gethostname(host, 256);
             update_json_state(auto_id, host, r, c, 1, 0, tx, rx, d_io, p_c, f_r, get_neighbors_list());
             
-            int ia_sock = socket(AF_INET, SOCK_DGRAM, 0);
-            if (ia_sock >= 0) {
-                struct sockaddr_in ia_addr;
-                ia_addr.sin_family = AF_INET;
-                ia_addr.sin_port = htons(9998);
-                inet_pton(AF_INET, "127.0.0.1", &ia_addr.sin_addr);
-                std::string t_data = get_telemetry(auto_id);
-                std::string payload = "TELEMETRY:" + t_data;
-                sendto(ia_sock, payload.c_str(), payload.length(), 0, (struct sockaddr*)&ia_addr, sizeof(ia_addr));
-                close(ia_sock);
-            }
+            std::string t_data = get_telemetry(auto_id);
+            std::string payload = "TELEMETRY:" + t_data;
+            telemetry_emitter->emit(payload);
 
             SLEEP_MS(report_interval.load());
         }
     }).detach();
+
+    // Dynamically retrieve token instead of using hardcoded macro
+    std::string agent_auth_token = get_agent_auth_token();
 
     while (keep_running) {
         int backoff = 1000; bool c2_connected = false;
@@ -920,7 +1021,7 @@ int main(int argc, char* argv[]) {
             if (send(sock, enc_mat.c_str(), 256, 0) != 256) { CLOSE_SOCKET(sock); continue; }
 
             memcpy(session_key, aes, 32);
-            std::string auth = encrypt_aes256_gcm("AUTH:" + std::string(AGENT_AUTH_TOKEN), session_key, iv);
+            std::string auth = encrypt_aes256_gcm("AUTH:" + agent_auth_token, session_key, iv);
             uint32_t al = htonl(auth.size()); send(sock, &al, 4, 0); send(sock, auth.c_str(), auth.size(), 0);
             SLEEP_MS(200); c2_connected = true;
 
@@ -948,7 +1049,7 @@ int main(int argc, char* argv[]) {
                             if (pipe_pos != std::string::npos) cmd_part = decrypted_cmd.substr(0, pipe_pos);
 
                             if (cmd_part == "CMD:REJOIN" && is_isolated) {
-                                std::cout << "\033[1;32m[GUÉRISON]\033[0m Ordre de réintégration reçu.\n";
+                                std::cout << "\033[1;32m[GU├ëRISON]\033[0m Ordre de r├®int├®gration re├ºu.\n";
                                 is_isolated = false; honeypot_triggered = false;
                                 report_interval = 5000; current_state = NORMAL;
                             }

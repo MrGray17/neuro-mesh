@@ -1,64 +1,54 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# ============================================================
-# NEURO-MESH : C2 BRIDGE API (Web-to-System Execution)
-# ============================================================
-
-import http.server
-import socketserver
-import subprocess
+import asyncio
+import websockets
 import json
-import os
 
-PORT = 5000
+# Thread-safe set of connected React UI clients
+connected_clients = set()
 
-class ThreatAPIHandler(http.server.SimpleHTTPRequestHandler):
+async def register_client(websocket):
+    """Registers a new React dashboard connection."""
+    connected_clients.add(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        connected_clients.remove(websocket)
+
+class TelemetryReceiver(asyncio.DatagramProtocol):
+    """Listens for high-speed UDP packets from the C++ agent."""
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        message = data.decode('utf-8')
+        # If we have connected UI clients, push the telemetry to them
+        if connected_clients:
+            asyncio.create_task(self.broadcast(message))
+
+    async def broadcast(self, message):
+        """Fan-out the JSON log to all WebSockets."""
+        # websockets.broadcast is optimized for concurrent fan-out
+        websockets.broadcast(connected_clients, message)
+
+async def main():
+    print("🚀 Neuro-Mesh Bridge API Online.")
     
-    # Gestion des règles CORS (Pour autoriser React à parler à cette API)
-    def do_OPTIONS(self):
-        self.send_response(200, "ok")
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'X-Requested-With, Content-type')
-        self.end_headers()
-
-    def do_POST(self):
-        if self.path == '/api/attack':
-            try:
-                # Vérification de l'existence du script d'attaque
-                if not os.path.exists("./test_attack.sh"):
-                    raise FileNotFoundError("Le script test_attack.sh est introuvable.")
-
-                # Exécution asynchrone du script bash
-                subprocess.Popen(["./test_attack.sh", "--force"])
-                
-                # Réponse de succès au Dashboard
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "attack_launched"}).encode())
-                print("\n\033[1;31m[API] 💣 Ordre d'attaque reçu depuis le Dashboard ! Lancement du payload...\033[0m")
-                
-            except Exception as e:
-                # Gestion des erreurs
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-                print(f"\n\033[1;33m[ERREUR API] {str(e)}\033[0m")
-        else:
-            self.send_response(404)
-            self.end_headers()
+    # 1. Start WebSocket server for React (Port 8080)
+    async with websockets.serve(register_client, "localhost", 8080):
+        print("📡 WebSocket Server listening on ws://localhost:8080")
+        
+        # 2. Start UDP listener for C++ agent (Port 50052)
+        loop = asyncio.get_running_loop()
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: TelemetryReceiver(),
+            local_addr=('127.0.0.1', 50052)
+        )
+        print("🔌 Internal UDP Listener bound to 127.0.0.1:50052")
+        
+        # Keep the event loop alive forever
+        await asyncio.Future()
 
 if __name__ == "__main__":
     try:
-        # Configuration pour réutiliser le port immédiatement après un arrêt
-        socketserver.TCPServer.allow_reuse_address = True
-        with socketserver.TCPServer(("", PORT), ThreatAPIHandler) as httpd:
-            print(f"\033[1;36m[BRIDGE] 🌉 API de pont en écoute sur le port {PORT}...\033[0m")
-            print("\033[1;32m[STATUS] Le bouton 'INJECT THREAT' du Dashboard est connecté au système Linux.\033[0m")
-            httpd.serve_forever()
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\033[1;33m[BRIDGE] Arrêt de l'API.\033[0m")
+        print("\n[Shutting down Bridge API]")

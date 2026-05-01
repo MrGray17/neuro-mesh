@@ -1,20 +1,20 @@
-# Ignorer les exécutables compilés
+# Binaries
+bin/
 client
 listener
-sentry
-
-# Ignorer les fichiers de données dynamiques (facultatif)
-# api.json
-
-# Ignorer les fichiers temporaires ou de backup
+obj/
 *.o
-*.swp
-*~
-neuro-mesh-env/
+*.skel.h
+
+# Secrets & State
+api.json
+api_tmp.json
+ia_commands.txt
+.env
+trained_models/
+venv/
 node_modules/
-__pycache__/
-*.joblib
-neuro-mesh-env/
-node_modules/
-__pycache__/
-*.joblib
+
+# OS/IDEs
+.DS_Store
+.vscode/

@@ -21,6 +21,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -37,7 +38,7 @@
 using json = nlohmann::json;
 
 void log_event_safe(const std::string& message);
-void log_event_unsafe(const std::string& message);
+void export_to_json();
 
 #define RSA_KEY_BITS        2048
 #define RSA_PADDING         RSA_PKCS1_OAEP_PADDING
@@ -53,7 +54,6 @@ void log_event_unsafe(const std::string& message);
 #define JSON_TMP_FILE       "api_tmp.json"
 #define JSON_FILE           "api.json"
 #define WS_PORT             8081
-#define AGENT_AUTH_TOKEN    "NEURO_MESH_SECRET"
 #define MAX_C2_CONNECTIONS  500
 
 struct AgentNode {
@@ -96,6 +96,18 @@ struct ConnectionGuard {
     ConnectionGuard(std::atomic<unsigned int>& c) : counter(c) { counter++; }
     ~ConnectionGuard() { if (counter > 0) counter--; }
 };
+
+// ============================================================
+// INFRASTRUCTURE: SECRETS MANAGEMENT (Fail Fast Pattern)
+// ============================================================
+std::string get_c2_auth_token() {
+    const char* env_token = std::getenv("NEURO_MESH_SECRET");
+    if (!env_token || std::strlen(env_token) == 0) {
+        std::cerr << "\033[1;41;37m[FATAL] NEURO_MESH_SECRET environment variable is missing on C2!\033[0m\n";
+        exit(EXIT_FAILURE);
+    }
+    return std::string(env_token);
+}
 
 std::string base64_encode(const unsigned char* input, int length) {
     static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -212,30 +224,31 @@ int recv_full(int sock, char* buffer, size_t total_len, int flags = 0) {
     return static_cast<int>(received);
 }
 
-void add_log_unsafe(const std::string& message) {
-    if (security_logs.size() >= MAX_LOG_ENTRIES) security_logs.pop_front();
-    security_logs.push_back(message);
-}
-
 void log_event_safe(const std::string& message) {
     std::lock_guard<std::mutex> lock(log_mutex);
     time_t now = time(0); struct tm tstruct = *localtime(&now); char buf[80];
     strftime(buf, sizeof(buf), "[%H:%M:%S]", &tstruct);
     std::string full_msg = std::string(buf) + " " + message;
-    add_log_unsafe(full_msg); std::cout << "\033[1;30m" << full_msg << "\033[0m" << std::endl;
+    
+    if (security_logs.size() >= MAX_LOG_ENTRIES) security_logs.pop_front();
+    security_logs.push_back(full_msg); 
+    std::cout << "\033[1;30m" << full_msg << "\033[0m" << std::endl;
 }
 
-void log_event_unsafe(const std::string& message) {
-    time_t now = time(0); struct tm tstruct = *localtime(&now); char buf[80];
-    strftime(buf, sizeof(buf), "[%H:%M:%S]", &tstruct);
-    std::string full_msg = std::string(buf) + " " + message;
-    add_log_unsafe(full_msg); std::cout << "\033[1;30m" << full_msg << "\033[0m" << std::endl;
-}
+// ============================================================
+// DATA EXPORT (Lock-Free I/O Optimization)
+// ============================================================
+void export_to_json() {
+    static auto last_export = std::chrono::steady_clock::now() - std::chrono::milliseconds(1000);
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_export).count() < 100) return;
+    last_export = now;
 
-void export_to_json_unsafe() {
+    // 1. Parse external AI commands
     std::ifstream cmd_file("ia_commands.txt");
     if (cmd_file.is_open()) {
         std::string line;
+        std::lock_guard<std::mutex> lock(system_mutex);
         while (std::getline(cmd_file, line)) {
             if (line.find("CMD_IA:ISOLATE|") != std::string::npos) {
                 std::string target_id = line.substr(15);
@@ -246,23 +259,34 @@ void export_to_json_unsafe() {
                 }
             }
         }
+        cmd_file.close();
     }
 
-    static auto last_export = std::chrono::steady_clock::now() - std::chrono::milliseconds(1000);
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_export).count() < 100) return;
-    last_export = now;
+    // 2. Snapshot data quickly to minimize lock contention
+    std::vector<AgentNode> snapshot_nodes;
+    std::vector<AgentNode> snapshot_alerts;
+    std::vector<std::string> snapshot_logs;
 
-    std::vector<std::pair<int, AgentNode>> snapshot;
-    for (const auto& p : active_nodes) snapshot.push_back(p);
+    {
+        std::lock_guard<std::mutex> lock(system_mutex);
+        for (const auto& p : active_nodes) snapshot_nodes.push_back(p.second);
+        for (const auto& p : historical_alerts) snapshot_alerts.push_back(p.second);
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        size_t start = (security_logs.size() > 15) ? security_logs.size() - 15 : 0;
+        for (size_t i = start; i < security_logs.size(); ++i) snapshot_logs.push_back(security_logs[i]);
+    }
 
+    // 3. Serialize and Write to disk outside the locks
     json j;
     j["architecture"] = "NEURO-MESH (Sovereign Distributed C2)";
     j["system_status"] = "ONLINE";
     j["active_nodes"] = json::array();
 
-    for (const auto& p : snapshot) {
-        const auto& node = p.second; json node_json;
+    for (const auto& node : snapshot_nodes) {
+        json node_json;
         node_json["id"] = node.id; node_json["hostname"] = node.hostname; node_json["ip"] = node.ip;
         node_json["ram_mb"] = node.ram_mb; node_json["cpu_load"] = node.cpu_load; node_json["procs"] = node.procs;
         node_json["latency"] = node.latency; node_json["net_out_bytes_s"] = node.net_out; node_json["net_tx_bs"] = node.net_tx_bs;
@@ -271,8 +295,8 @@ void export_to_json_unsafe() {
         j["active_nodes"].push_back(node_json);
     }
 
-    for (const auto& p : historical_alerts) {
-        const auto& node = p.second; json node_json;
+    for (const auto& node : snapshot_alerts) {
+        json node_json;
         node_json["id"] = node.id; node_json["hostname"] = node.hostname; node_json["ip"] = node.ip;
         node_json["ram_mb"] = node.ram_mb; node_json["cpu_load"] = node.cpu_load; node_json["procs"] = node.procs;
         node_json["latency"] = node.latency; node_json["net_out_bytes_s"] = node.net_out; node_json["net_tx_bs"] = node.net_tx_bs;
@@ -282,13 +306,16 @@ void export_to_json_unsafe() {
     }
 
     j["logs"] = json::array();
-    size_t start = (security_logs.size() > 15) ? security_logs.size() - 15 : 0;
-    for (size_t i = start; i < security_logs.size(); ++i) j["logs"].push_back(security_logs[i]);
+    for (const auto& log : snapshot_logs) j["logs"].push_back(log);
 
     std::string dump_content = j.dump();
 
     std::ofstream file(JSON_TMP_FILE);
-    if (file.is_open()) { file << dump_content; file.close(); std::rename(JSON_TMP_FILE, JSON_FILE); }
+    if (file.is_open()) { 
+        file << dump_content; 
+        file.close(); 
+        std::rename(JSON_TMP_FILE, JSON_FILE); 
+    }
     broadcast_websocket(dump_content);
 }
 
@@ -367,7 +394,7 @@ std::string get_neighbor_list_unsafe(int requester_sock) {
 }
 
 void broadcast_alert_unsafe(int compromised_socket, const std::string& threat_host) {
-    log_event_unsafe("[SAGESSE COLLECTIVE] Propagation de l'alerte réseau. Cible initiale : " + threat_host);
+    log_event_safe("[SAGESSE COLLECTIVE] Propagation de l'alerte r├®seau. Cible initiale : " + threat_host);
     for (auto const& [sock, node] : active_nodes) {
         if (sock != compromised_socket && node.status == "STABLE") {
             std::string alert_msg = "CMD:GLOBAL_ALERT|" + threat_host;
@@ -386,7 +413,6 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
     char client_ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
     AgentNode this_node; this_node.ip = std::string(client_ip);
 
-    // 🔥 FIX RESILIENCE : Timeout à 40s pour survivre au CPU Starvation
     struct timeval tv; tv.tv_sec = 40; tv.tv_usec = 0;
     setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -406,6 +432,7 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
 
     this_node.status = "STABLE"; this_node.latency = 5000;
 
+    // FIX: Verify the actual token contents
     uint32_t auth_len;
     if (recv_full(client_socket, (char*)&auth_len, 4) == 4) {
         auth_len = ntohl(auth_len);
@@ -413,15 +440,21 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
             std::vector<char> auth_buf(auth_len);
             if (recv_full(client_socket, auth_buf.data(), auth_len) == (int)auth_len) {
                 std::string decrypted_auth = decrypt_aes256_gcm((unsigned char*)auth_buf.data(), auth_len, this_node.session_key);
-            }
-        }
-    }
+                std::string expected_auth = "AUTH:" + get_c2_auth_token();
+                if (decrypted_auth != expected_auth) {
+                    log_event_safe("\033[1;41;37m[ALERT] Invalid auth token from " + std::string(client_ip) + "!\033[0m");
+                    close(client_socket); 
+                    return;
+                }
+            } else { close(client_socket); return; }
+        } else { close(client_socket); return; }
+    } else { close(client_socket); return; }
 
     {
         std::lock_guard<std::mutex> lock(system_mutex); active_nodes[client_socket] = this_node;
-        log_event_unsafe("[ACCÈS] Connexion TCP établie et synchronisée : " + std::string(client_ip));
-        export_to_json_unsafe();
     }
+    log_event_safe("[ACC├êS] Connexion TCP ├®tablie et synchronis├®e : " + std::string(client_ip));
+    export_to_json();
 
     bool is_first_message = true; auto last_msg_time = std::chrono::steady_clock::now();
 
@@ -449,13 +482,13 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
 
             if (j.contains("ATTACK") && j["ATTACK"].is_string() && j["ATTACK"] == "TRUE") this_node.status = "COMPROMIS";
             if (j.contains("STATUS") && j["STATUS"].is_string() && j["STATUS"] == "SELF_ISOLATED") {
-                this_node.status = "COMPROMIS"; log_event_unsafe("\033[1;41;37m[SELF-ISOLATION]\033[0m Agent " + this_node.id + " s'est auto-isolé.");
+                this_node.status = "COMPROMIS"; log_event_safe("\033[1;41;37m[SELF-ISOLATION]\033[0m Agent " + this_node.id + " s'est auto-isol├®.");
             }
             if (j.contains("STATE") && j["STATE"].is_string()) {
                 std::string state = j["STATE"].get<std::string>();
                 if (state == "COORDINATOR" && this_node.p2p_state != "COORDINATOR") {
-                    this_node.p2p_state = "COORDINATOR"; std::lock_guard<std::mutex> lock(system_mutex);
-                    log_event_unsafe("\033[1;36m[RÉSILIENCE]\033[0m L'agent " + this_node.id + " a maintenu le maillage !");
+                    this_node.p2p_state = "COORDINATOR";
+                    log_event_safe("\033[1;36m[R├ëSILIENCE]\033[0m L'agent " + this_node.id + " a maintenu le maillage !");
                 } else { this_node.p2p_state = state; }
             }
         } catch (...) { continue; }
@@ -473,10 +506,18 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
             if (this_node.status == "COMPROMIS" || diff < 400) {
                 bool was_stable = (active_nodes[client_socket].status != "COMPROMIS");
                 this_node.status = "COMPROMIS"; command_to_send = "CMD:ISOLATE_NETWORK"; active_nodes[client_socket] = this_node;
-                if (was_stable) { log_event_unsafe("\033[1;41;37m[INTRUSION]\033[0m Menace confirmée sur " + this_node.hostname); broadcast_alert_unsafe(client_socket, this_node.hostname); }
-            } else { this_node.status = "STABLE"; command_to_send = "CMD:STANDBY|" + get_neighbor_list_unsafe(client_socket); active_nodes[client_socket] = this_node; }
-            export_to_json_unsafe();
+                if (was_stable) { 
+                    log_event_safe("\033[1;41;37m[INTRUSION]\033[0m Menace confirm├®e sur " + this_node.hostname); 
+                    broadcast_alert_unsafe(client_socket, this_node.hostname); 
+                }
+            } else { 
+                this_node.status = "STABLE"; 
+                command_to_send = "CMD:STANDBY|" + get_neighbor_list_unsafe(client_socket); 
+                active_nodes[client_socket] = this_node; 
+            }
         }
+        
+        export_to_json();
 
         unsigned char iv_out[AES_GCM_IV_LEN]; std::string encrypted_cmd = encrypt_aes256_gcm(command_to_send, this_node.session_key, iv_out);
         uint32_t out_len = htonl(encrypted_cmd.size());
@@ -494,8 +535,8 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
             }
             active_nodes.erase(client_socket);
         }
-        export_to_json_unsafe();
     }
+    export_to_json();
 }
 
 void hide_process_name(int argc, char* argv[]) {

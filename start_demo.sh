@@ -2,7 +2,7 @@
 
 # ============================================================
 # NEURO-MESH : DEPLOYMENT SCRIPT (ULTIMATE EDITION)
-# PBFT + Edge AI + React Dashboard + CORS Bypass
+# PBFT + Edge AI + React Dashboard + Zero-Trust Execution
 # ============================================================
 
 # Couleurs pour l'affichage terminal
@@ -16,6 +16,11 @@ NC='\033[0m'
 echo -e "${CYAN}==============================================${NC}"
 echo -e "${CYAN}      INITIALISATION DE NEURO-MESH V3.0       ${NC}"
 echo -e "${CYAN}==============================================${NC}"
+
+# 0. INJECTION DES SECRETS (Zero-Trust)
+echo -e "\n${YELLOW}[*] Injection des variables d'environnement...${NC}"
+export NEURO_MESH_SECRET="NEURO_MESH_DEFAULT_SECURE_TOKEN_2026"
+echo -e "${GREEN}[+] Clé d'authentification verrouillée en mémoire.${NC}"
 
 # 1. Nettoyage de la zone de combat
 echo -e "\n${YELLOW}[*] Purge des anciens processus...${NC}"
@@ -35,7 +40,7 @@ else
     exit 1
 fi
 
-# 3. Lancement du Cortex IA Central (optionnel selon ton archi, mais sécurisé)
+# 3. Lancement du Cortex IA Central
 echo -e "\n${YELLOW}[*] Activation du Cortex IA (brain_ia.py)...${NC}"
 if [ -f "brain_ia.py" ]; then
     python3 brain_ia.py > /dev/null 2>&1 &
@@ -64,7 +69,6 @@ fi
 echo -e "\n${YELLOW}[*] Déploiement des interfaces de monitoring...${NC}"
 echo -e "${CYAN}  -> Configuration du pont HTTP CORS (Port 8000)...${NC}"
 
-# 🔥 LE SERVEUR PYTHON AVEC CONTOURNEMENT CORS
 python3 -c "
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 class CORSRequestHandler(SimpleHTTPRequestHandler):
@@ -83,7 +87,6 @@ if [ -d "$DASHBOARD_DIR" ]; then
     echo -e "${CYAN}  -> Lancement du Dashboard React (Port 3000)...${NC}"
     cd "$DASHBOARD_DIR"
     
-    # Vérifie si npm install a été fait
     if [ ! -d "node_modules" ]; then
         echo -e "${YELLOW}  -> Installation des dépendances (patientez un instant)...${NC}"
         npm install --silent

@@ -1,82 +1,54 @@
-# ============================================================
-# NEURO-MESH FORGE : ULTIME EDITION (GCM + cross-platform)
-# ============================================================
-# Auteur : El Yazid
-# Description : Compilation de l'écosystème complet NEURO-MESH
-# ============================================================
+# ==============================================================================
+# NEURO-MESH : SOVEREIGN BUILD SYSTEM (UNIFIED PIPELINE)
+# ==============================================================================
 
-CXX = g++
-CXXFLAGS = -Wall -std=c++17 -O3 -s -fno-ident
-LDFLAGS = -pthread -lssl -lcrypto -lcurl
+CXX = clang++
+CXXFLAGS = -std=c++20 -Wall -Wextra -Werror -O3
+BPF_CC = clang
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86
 
-TARGETS = listener client packer
+# Libraries
+SSL_LIBS = -lssl -lcrypto -lpthread
+BPF_LIBS = -lbpf -lelf -lz -lpthread
 
-all: banner $(TARGETS) size_report
+# Paths
+SRC_DIR = src
+BPF_SRC = $(SRC_DIR)/bpf/sensor.bpf.c
+OBJ_DIR = obj
+BIN_DIR = bin
 
-banner:
-	@echo ""
-	@echo -e "\033[0;36m========================================\033[0m"
-	@echo -e "\033[0;36m🧬 NEURO-MESH : COMPILATION ULTIME\033[0m"
-	@echo -e "\033[0;36m========================================\033[0m"
-	@echo -e "\033[1;33m📦 CXXFLAGS : $(CXXFLAGS)\033[0m"
-	@echo -e "\033[1;33m🔗 LDFLAGS  : $(LDFLAGS)\033[0m"
-	@echo -e "\033[0;36m========================================\033[0m"
-	@echo ""
+# Targets
+AGENT_TARGET = $(BIN_DIR)/neuro_agent
+CLIENT_TARGET = client
+LISTENER_TARGET = listener
 
-listener: listener.cpp
-	@echo -e "\033[1;33m🧠 Compilation du C2 (listener)...\033[0m"
-	$(CXX) $(CXXFLAGS) listener.cpp -o listener $(LDFLAGS)
-	@echo -e "\033[0;32m✅ C2 généré\033[0m"
+all: directories $(AGENT_TARGET) $(CLIENT_TARGET) $(LISTENER_TARGET)
 
-client: client.cpp
-	@echo -e "\033[1;33m🛡️ Compilation de l'agent...\033[0m"
-	$(CXX) $(CXXFLAGS) client.cpp -o client $(LDFLAGS)
-	@echo -e "\033[0;32m✅ Agent généré\033[0m"
+directories:
+	@mkdir -p $(OBJ_DIR)
+	@mkdir -p $(BIN_DIR)
 
-packer: packer.cpp
-	@echo -e "\033[1;33m📦 Compilation du packer...\033[0m"
-	$(CXX) $(CXXFLAGS) packer.cpp -o packer $(LDFLAGS)
-	@echo -e "\033[0;32m✅ Packer généré\033[0m"
+# 1. Compile BPF code to object file
+$(OBJ_DIR)/sensor.bpf.o: $(BPF_SRC)
+	$(BPF_CC) $(BPF_CFLAGS) -c $< -o $@
 
-dashboard-install:
-	@echo -e "\033[1;33m📦 Installation dépendances dashboard React...\033[0m"
-	cd dashboard-react && npm install
+# 2. Generate C Header Skeleton from BPF object
+$(SRC_DIR)/sensor.skel.h: $(OBJ_DIR)/sensor.bpf.o
+	bpftool gen skeleton $< > $@
 
-dashboard-build:
-	@echo -e "\033[1;33m⚛️  Build dashboard React (version production)...\033[0m"
-	cd dashboard-react && npm run build
+# 3. Compile Core Sovereign Agent
+$(AGENT_TARGET): $(SRC_DIR)/main.cpp $(SRC_DIR)/SovereignCell.cpp $(SRC_DIR)/InferenceEngine.cpp $(SRC_DIR)/SystemJailer.cpp $(SRC_DIR)/MeshNode.cpp $(SRC_DIR)/AuditLogger.cpp $(SRC_DIR)/sensor.skel.h
+	$(CXX) $(CXXFLAGS) $(SRC_DIR)/main.cpp $(SRC_DIR)/SovereignCell.cpp $(SRC_DIR)/InferenceEngine.cpp $(SRC_DIR)/SystemJailer.cpp $(SRC_DIR)/MeshNode.cpp $(SRC_DIR)/AuditLogger.cpp -o $@ $(BPF_LIBS)
 
-dashboard-start:
-	@echo -e "\033[1;33m🚀 Lancement dashboard React (dev)...\033[0m"
-	cd dashboard-react && npm start &
+# 4. Compile P2P Mesh Client
+$(CLIENT_TARGET): client.cpp
+	$(CXX) $(CXXFLAGS) client.cpp -o $@ $(SSL_LIBS)
 
-size_report:
-	@echo ""
-	@echo -e "\033[0;36m========================================\033[0m"
-	@echo -e "\033[0;36m📊 TAILLE DES BINAIRES\033[0m"
-	@echo -e "\033[0;36m========================================\033[0m"
-	@for bin in $(TARGETS); do \
-		if [ -f $$bin ]; then \
-			SIZE=$$(ls -lh $$bin | awk '{print $$5}'); \
-			echo -e "\033[0;32m✅ $$bin : $$SIZE\033[0m"; \
-		else \
-			echo -e "\033[0;31m❌ $$bin : non trouvé\033[0m"; \
-		fi \
-	done
-	@echo -e "\033[0;36m========================================\033[0m"
-	@echo ""
+# 5. Compile C2 Listener
+$(LISTENER_TARGET): listener.cpp
+	$(CXX) $(CXXFLAGS) listener.cpp -o $@ $(SSL_LIBS)
 
 clean:
-	@echo -e "\033[1;33m🧹 Nettoyage des binaires et fichiers temporaires...\033[0m"
-	rm -f $(TARGETS) api.json api_tmp.json api_react.json react_temp.json ia_commands.txt incident_report.txt *.log
-	@echo -e "\033[0;32m✅ Nettoyage effectué\033[0m"
+	rm -rf $(OBJ_DIR) $(BIN_DIR) $(SRC_DIR)/sensor.skel.h $(CLIENT_TARGET) $(LISTENER_TARGET)
 
-distclean: clean
-	@echo -e "\033[1;33m🧹 Nettoyage complet (y compris modèles IA)...\033[0m"
-	rm -f *.o *.so core core.*
-	rm -rf trained_models/
-	@echo -e "\033[0;32m✅ Nettoyage complet terminé\033[0m"
-
-rebuild: clean all
-
-.PHONY: all clean distclean rebuild dashboard-install dashboard-build dashboard-start
+.PHONY: all directories clean
