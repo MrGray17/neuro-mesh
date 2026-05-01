@@ -1,25 +1,17 @@
 #pragma once
-#include <memory>
 #include <string>
+#include <thread>
 #include <atomic>
-#include <thread> // Required for hardware monitor
-#include <bpf/libbpf.h>
+#include <memory>
+#include <chrono> // Required for the Immunity Clock
 #include "InferenceEngine.hpp"
-#include "SystemJailer.hpp"
 #include "MeshNode.hpp"
+#include "SystemJailer.hpp"
 
-struct sensor_bpf;
 struct ring_buffer;
+struct sensor_bpf;
 
 namespace neuro_mesh::core {
-
-struct KernelEvent {
-    uint32_t pid;
-    uint32_t ppid;
-    uint32_t event_type;
-    char comm[16];
-    char payload[256];
-};
 
 class SovereignCell {
 public:
@@ -30,26 +22,32 @@ public:
 
     static Result create(const std::string& node_id);
     ~SovereignCell();
-    void run() noexcept;
+
+    // UPDATED: Now safely accepts atomic flags from the main POSIX signal handler
+    void run(std::atomic<bool>* shutdown_flag, std::atomic<bool>* vaccine_flag) noexcept;
+    
     void trigger_shutdown() noexcept;
+    void vaccinate();
 
 private:
     explicit SovereignCell(std::string id);
-    std::string load_and_attach_ebpf(); 
+    std::string load_and_attach_ebpf();
     static int handle_ringbuf_event(void *ctx, void *data, size_t size);
-    
-    void telemetry_loop(); // Background hardware monitor loop
+    void telemetry_loop();
 
     std::string m_node_id;
     std::atomic<bool> m_running{true};
-    std::thread m_telemetry_thread; // Hardware monitor thread
-    
-    ::sensor_bpf* m_skel{nullptr};
-    ::ring_buffer* m_ringbuf{nullptr};
+    std::thread m_telemetry_thread;
 
     ai::InferenceEngine m_brain;
-    defense::SystemJailer m_jailer;
     network::MeshNode m_mesh_node;
+    SystemJailer m_jailer;
+
+    sensor_bpf* m_skel = nullptr;
+    ring_buffer* m_ringbuf = nullptr;
+
+    // THE SHIELD: Tracks how long the agent should ignore the ring buffer backlog
+    std::atomic<std::chrono::steady_clock::time_point> m_immunity_until{std::chrono::steady_clock::now()};
 };
 
 } // namespace neuro_mesh::core

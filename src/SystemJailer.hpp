@@ -1,35 +1,21 @@
-/**
- * @file SystemJailer.hpp
- * @brief Deterministic process containment using cgroups v2.
- */
-
 #pragma once
-#include <string>
-#include <filesystem>
-#include <expected>
+#include <vector>
+#include <mutex>
+#include <sys/types.h>
 
-namespace neuro_mesh::defense {
-
-enum class JailError {
-    CGROUP_SETUP_FAILED,
-    ATTACH_FAILED,
-    RESOURCE_LIMIT_FAILED,
-    PID_NOT_FOUND
-};
+namespace neuro_mesh::core {
 
 class SystemJailer {
 public:
-    SystemJailer();
-    ~SystemJailer();
+    SystemJailer() = default;
+    ~SystemJailer() = default;
 
-    /**
-     * @brief Imprisons a PID in a restricted cgroup with 0.01% CPU and no network.
-     */
-    bool imprison(uint32_t pid);
+    void imprison(pid_t pid);
+    void release_all(); // NEW: The Vaccination mechanism
 
 private:
-    std::filesystem::path m_jail_path;
-    bool initialize_base_cgroup();
+    std::vector<pid_t> m_jailed_pids;
+    std::mutex m_jail_mutex;
 };
 
-} // namespace neuro_mesh::defense
+} // namespace neuro_mesh::core

@@ -1,50 +1,42 @@
+#include "SovereignCell.hpp"
 #include <iostream>
 #include <csignal>
 #include <memory>
-#include "SovereignCell.hpp"
-#include "AuditLogger.hpp"
+#include <unistd.h>
+#include <atomic>
 
-// Global pointer for the signal handler to access the orchestrator
-neuro_mesh::core::SovereignCell* g_cell_ptr = nullptr;
+std::unique_ptr<neuro_mesh::core::SovereignCell> global_cell = nullptr;
+std::atomic<bool> g_shutdown_requested{false};
+std::atomic<bool> g_vaccine_requested{false};
 
-// Graceful shutdown handler
-void handle_signal(int sig) {
-    if (g_cell_ptr) {
-        std::cout << "\n[MAIN] Signal " << sig << " received. Initiating graceful shutdown sequence...\n";
-        g_cell_ptr->trigger_shutdown();
+void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        g_shutdown_requested.store(true);
+    } 
+    else if (signum == SIGUSR1) {
+        // STRICT POSIX COMPLIANCE: Never call functions in a signal handler.
+        // Just flip an atomic flag so the main loop handles it safely.
+        g_vaccine_requested.store(true);
     }
 }
 
 int main() {
-    // 1. Initialize the Asynchronous Data Diode (UDP Telemetry)
-    neuro_mesh::telemetry::AuditLogger::initialize();
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGUSR1, signal_handler); 
 
-    // 2. Bind OS signals for clean exits
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-
-    std::cout << "====================================================\n";
-    std::cout << "  NEURO-MESH : SOVEREIGN AGENT INITIALIZING...      \n";
-    std::cout << "====================================================\n";
-
-    // 3. Instantiate the Sovereign Cell
-    auto result = neuro_mesh::core::SovereignCell::create("SOVEREIGN_NODE_01");
+    std::string dynamic_node_id = "NODE_" + std::to_string(getpid());
+    auto [cell, err] = neuro_mesh::core::SovereignCell::create(dynamic_node_id);
     
-    if (!result.error.empty()) {
-        std::cerr << "[MAIN] FATAL BOOT ERROR: " << result.error << "\n";
+    if (!err.empty()) {
+        std::cerr << "[MAIN] FATAL BOOT ERROR: " << err << std::endl;
         return 1;
     }
 
-    // Transfer ownership to a local unique_ptr and set the raw pointer for the signal handler
-    std::unique_ptr<neuro_mesh::core::SovereignCell> cell = std::move(result.cell);
-    g_cell_ptr = cell.get();
-
-    // 4. Enter the primary event loop (This blocks until trigger_shutdown is called)
-    cell->run();
-
-    // 5. Cleanup
-    g_cell_ptr = nullptr;
-    std::cout << "[MAIN] Neuro-Mesh Agent successfully detached. System offline.\n";
+    global_cell = std::move(cell);
     
+    // Pass the atomic flags into the safe main execution loop
+    global_cell->run(&g_shutdown_requested, &g_vaccine_requested);
+
     return 0;
 }

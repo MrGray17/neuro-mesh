@@ -110,6 +110,7 @@ std::atomic<bool> is_isolated{false};
 std::atomic<int> report_interval{5000};
 std::atomic<unsigned int> active_honeypot_threads{0};
 std::atomic<bool> signal_pending{false};
+std::atomic<bool> heal_pending{false}; // <-- ADDED FOR LOCAL VACCINE
 
 unsigned char session_key[AES_KEY_LEN];
 
@@ -166,7 +167,7 @@ public:
 
     void emit(const std::string& payload) const noexcept {
         if (m_sock >= 0) {
-            sendto(m_sock, payload.c_str(), payload.length(), 0, 
+            sendto(m_sock, payload.c_str(), payload.length(), 0,
                    (struct sockaddr*)&m_ia_addr, sizeof(m_ia_addr));
         }
     }
@@ -343,7 +344,7 @@ std::string data_to_sign(pbft::PBFType type, uint64_t view, uint64_t seq, const 
 void pbft_init_identity(const std::string& node_id) {
     pbft::my_identity.node_id = node_id;
     pbft::my_identity.privkey = pbft::generate_ed25519_key();
-    if (!pbft::my_identity.privkey) { std::cerr << "Erreur cl├® Ed25519\n"; exit(1); }
+    if (!pbft::my_identity.privkey) { std::cerr << "Erreur clé Ed25519\n"; exit(1); }
     pbft::my_identity.pubkey_pem = pbft::pubkey_to_pem(pbft::my_identity.privkey);
 }
 
@@ -459,7 +460,7 @@ void handle_pbft_message(const json& msg) {
                         if (inst.commit_votes.size() >= quorum && !inst.decided) {
                             inst.decided = true; inst.decision_value = true;
                             if (inst.proposal.find("ISOLATE:" + pbft::my_identity.node_id) == 0 && !is_isolated) {
-                                std::cout << "\033[1;41;37m[PBFT] Auto-isolation confirm├®e!\033[0m\n";
+                                std::cout << "\033[1;41;37m[PBFT] Auto-isolation confirmée!\033[0m\n";
                                 is_isolated = true; report_interval = 1000; current_state = NORMAL;
                             }
                         }
@@ -501,9 +502,9 @@ void pbft_cleanup_and_retransmit() {
         time_t now = time(nullptr);
         for (auto it = pbft::known_peers.begin(); it != pbft::known_peers.end(); ) {
             // FIX: PBFT Tombstoning - Retain peers longer (300s) to survive partitions
-            if (now - it->second.last_seen > 300) { 
-                EVP_PKEY_free(it->second.pubkey); 
-                it = pbft::known_peers.erase(it); 
+            if (now - it->second.last_seen > 300) {
+                EVP_PKEY_free(it->second.pubkey);
+                it = pbft::known_peers.erase(it);
             }
             else { ++it; }
         }
@@ -546,17 +547,17 @@ std::string decrypt_aes256_gcm(const unsigned char* full_msg, size_t full_len, c
 std::string rsa_encrypt(EVP_PKEY* pub_key, const unsigned char* data, size_t data_len) {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub_key, nullptr);
     if (!ctx) return "";
-    EVP_PKEY_encrypt_init(ctx); 
+    EVP_PKEY_encrypt_init(ctx);
     EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PADDING);
     EVP_PKEY_CTX_set_rsa_oaep_md(ctx, RSA_OAEP_MD);
     EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, RSA_MGF1_MD);
 
-    size_t outlen = 0; 
+    size_t outlen = 0;
     EVP_PKEY_encrypt(ctx, nullptr, &outlen, data, data_len);
     unsigned char* out = new unsigned char[outlen];
     EVP_PKEY_encrypt(ctx, out, &outlen, data, data_len);
-    std::string result((char*)out, outlen); 
-    delete[] out; 
+    std::string result((char*)out, outlen);
+    delete[] out;
     EVP_PKEY_CTX_free(ctx);
     return result;
 }
@@ -569,9 +570,9 @@ void tarpit_honeypot() {
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     struct sockaddr_in address; address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY;
     int port = 2222; address.sin_port = htons(port);
-    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { 
-        port++; address.sin_port = htons(port); 
-        if (port > 2250) return; 
+    while (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        port++; address.sin_port = htons(port);
+        if (port > 2250) return;
     }
     listen(server_fd, 100);
 
@@ -579,20 +580,20 @@ void tarpit_honeypot() {
 
     std::vector<struct pollfd> fds;
     fds.push_back({server_fd, POLLIN, 0});
-    std::map<int, int> client_ticks; 
+    std::map<int, int> client_ticks;
 
     const char* banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2\r\n";
 
     while (keep_running) {
-        int ret = poll(fds.data(), fds.size(), 2000); 
+        int ret = poll(fds.data(), fds.size(), 2000);
         if (ret < 0) break;
 
         if (fds[0].revents & POLLIN) {
             struct sockaddr_in client_addr; socklen_t addrlen = sizeof(client_addr);
             int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
             if (client_socket >= 0) {
-                if (fds.size() < MAX_HONEYPOT_CONNECTIONS) { 
-                    int cflags = fcntl(client_socket, F_GETFL, 0); 
+                if (fds.size() < MAX_HONEYPOT_CONNECTIONS) {
+                    int cflags = fcntl(client_socket, F_GETFL, 0);
                     fcntl(client_socket, F_SETFL, cflags | O_NONBLOCK);
                     send(client_socket, banner, strlen(banner), 0);
                     fds.push_back({client_socket, POLLOUT, 0});
@@ -629,9 +630,9 @@ void tarpit_honeypot() {
                 ++i;
             }
         }
-        active_honeypot_threads = fds.size() - 1; 
+        active_honeypot_threads = fds.size() - 1;
     }
-    
+
     for (auto& pfd : fds) CLOSE_SOCKET(pfd.fd);
 }
 
@@ -643,7 +644,7 @@ void collect_local_metrics(long& ram, double& cpu, long long& net_tx, long long&
     double loads[1]; cpu = (getloadavg(loads, 1) != -1) ? loads[0] : 0.0;
 
     proc_count = std::thread::hardware_concurrency();
-    if (proc_count == 0) proc_count = 1; 
+    if (proc_count == 0) proc_count = 1;
 
     file_rate = 0;
     if (g_filenr && g_filenr->is_open()) { g_filenr->clear(); g_filenr->seekg(0); long a, b, c; (*g_filenr) >> a >> b >> c; file_rate = a; }
@@ -704,7 +705,7 @@ bool ia_check_anomaly(long ram, double cpu, long long net_tx, long long net_rx,
     for (int i = 0; i < 7; i++) {
         // FIX: Clamp standard deviation to prevent massive z-scores on idle systems
         double stddev = std::max(std::sqrt(running_M2[i] / (running_count - 1)), 0.001);
-        
+
         bool increase_only = (i == 0 || i == 1 || i == 2 || i == 4);
         if (increase_only) {
             if (cur[i] > running_mean[i] && ((cur[i] - running_mean[i]) / stddev) > IA_ZSCORE_THRESHOLD) return true;
@@ -743,7 +744,7 @@ void start_bully_election(std::string my_id) {
     if (is_isolated) return;
     current_state = ELECTION_MODE; received_ok = false; int my_score = calculate_priority();
     int jitter_ms = 5000 + (GET_PID() % 1000);
-    std::cout << "\033[1;33m[VOTE]\033[0m ├ëlection dans " << jitter_ms << " ms\n";
+    std::cout << "\033[1;33m[VOTE]\033[0m Élection dans " << jitter_ms << " ms\n";
     std::this_thread::sleep_for(std::chrono::milliseconds(jitter_ms));
     if(!keep_running) return;
     broadcast_bully_signed("MSG_VOTE", std::to_string(my_score));
@@ -874,7 +875,7 @@ void listen_for_neighbors(std::string my_id) {
                             EVP_PKEY* pub = pbft::pem_to_pubkey(pbft_msg["pubkey"]);
                             if (pub) pbft::known_peers[node_id] = {node_id, pub, time(nullptr)};
                         } else { pbft::known_peers[node_id].last_seen = time(nullptr); }
-                        
+
                         std::lock_guard<std::mutex> mlock(mesh_mutex);
                         bool found_m = false;
                         for (auto& n : active_mesh) { if (n.id == node_id) { n.last_seen = time(nullptr); found_m = true; break; } }
@@ -898,8 +899,8 @@ void ws_send(int fd, const std::string& message) {
     std::vector<unsigned char> frame;
     frame.push_back(0x81);
     size_t len = message.size();
-    if (len <= 125) { frame.push_back(len); } 
-    else if (len <= 65535) { frame.push_back(126); frame.push_back((len >> 8) & 0xFF); frame.push_back(len & 0xFF); } 
+    if (len <= 125) { frame.push_back(len); }
+    else if (len <= 65535) { frame.push_back(126); frame.push_back((len >> 8) & 0xFF); frame.push_back(len & 0xFF); }
     else { frame.push_back(127); for (int i = 7; i >= 0; i--) frame.push_back((len >> (i * 8)) & 0xFF); }
     frame.insert(frame.end(), message.begin(), message.end());
     send(fd, (char*)frame.data(), frame.size(), MSG_NOSIGNAL);
@@ -925,8 +926,13 @@ void update_json_state(const std::string& id, const std::string& host, long ram,
     std::lock_guard<std::mutex> lock(json_mutex); current_json_state = s; ws_broadcast(s);
 }
 
+// =================================================================
+// SIGNAL HANDLERS: ADDED heal_signal_handler FOR LOCAL VACCINE
+// =================================================================
 void isolation_signal_handler(int) { signal_pending = true; }
-void graceful_shutdown_handler(int) { keep_running = false; std::cout << "\n\033[1;33m[SYSTEME]\033[0m Arr├¬t gracieux...\n"; }
+void heal_signal_handler(int) { heal_pending = true; } 
+void graceful_shutdown_handler(int) { keep_running = false; std::cout << "\n\033[1;33m[SYSTEME]\033[0m Arrêt gracieux...\n"; }
+
 int recv_full(int sock, char* buffer, size_t total_len, int flags) {
     size_t r = 0; while (r < total_len) { int res = recv(sock, buffer + r, total_len - r, flags); if (res <= 0) return -1; r += res; }
     return (int)r;
@@ -938,12 +944,13 @@ int main(int argc, char* argv[]) {
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, isolation_signal_handler);
+    signal(SIGUSR2, heal_signal_handler); // <-- NEW SIGNAL REGISTRATION
     signal(SIGINT, graceful_shutdown_handler);
     signal(SIGTERM, graceful_shutdown_handler);
 #endif
     OpenSSL_add_all_algorithms(); srand(time(nullptr));
 
-    try { init_system_metrics(); init_p2p_socket(); } 
+    try { init_system_metrics(); init_p2p_socket(); }
     catch (const std::exception& e) { return EXIT_FAILURE; }
 
     std::string auto_id = "NODE_" + std::to_string(GET_PID());
@@ -969,9 +976,22 @@ int main(int argc, char* argv[]) {
         while (keep_running) {
             if (signal_pending) {
                 signal_pending = false;
-                std::cout << "\033[1;41;37m[SIGNAL] Isolation forc├®e re├ºue !\033[0m\n";
+                std::cout << "\033[1;41;37m[SIGNAL] Isolation forcée reçue !\033[0m\n";
                 is_isolated = true;
                 pbft_propose_isolation(auto_id);
+            }
+
+            // =================================================================
+            // NEW BLOCK: LOCAL HEAL LOGIC
+            // Resets `is_isolated` so `update_json_state` will broadcast STABLE
+            // =================================================================
+            if (heal_pending) {
+                heal_pending = false;
+                std::cout << "\033[1;32m[GUÉRISON]\033[0m Vaccin local appliqué. Réintégration au Mesh...\n";
+                is_isolated = false;
+                honeypot_triggered = false;
+                report_interval = 5000;
+                current_state = NORMAL;
             }
 
             long r, p_c, f_r; double c; long long tx, rx, d_io;
@@ -979,13 +999,13 @@ int main(int argc, char* argv[]) {
             update_ia_history(r, c, tx, rx, d_io, p_c, f_r);
 
             if (ia_check_anomaly(r, c, tx, rx, d_io, p_c, f_r) && !is_isolated) {
-                std::cout << "\033[1;41;37m[IA DISTRIBU├ëE]\033[0m Anomalie !\n";
+                std::cout << "\033[1;41;37m[IA DISTRIBUÉE]\033[0m Anomalie !\n";
                 pbft_propose_isolation(auto_id);
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
             char host[256]; gethostname(host, 256);
             update_json_state(auto_id, host, r, c, 1, 0, tx, rx, d_io, p_c, f_r, get_neighbors_list());
-            
+
             std::string t_data = get_telemetry(auto_id);
             std::string payload = "TELEMETRY:" + t_data;
             telemetry_emitter->emit(payload);
@@ -1049,7 +1069,7 @@ int main(int argc, char* argv[]) {
                             if (pipe_pos != std::string::npos) cmd_part = decrypted_cmd.substr(0, pipe_pos);
 
                             if (cmd_part == "CMD:REJOIN" && is_isolated) {
-                                std::cout << "\033[1;32m[GU├ëRISON]\033[0m Ordre de r├®int├®gration re├ºu.\n";
+                                std::cout << "\033[1;32m[GUÉRISON]\033[0m Ordre de réintégration reçu.\n";
                                 is_isolated = false; honeypot_triggered = false;
                                 report_interval = 5000; current_state = NORMAL;
                             }

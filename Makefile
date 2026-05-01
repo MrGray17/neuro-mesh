@@ -5,7 +5,9 @@
 CXX = clang++
 CXXFLAGS = -std=c++20 -Wall -Wextra -Werror -O3
 BPF_CC = clang
-BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86
+
+# Explicitly link host architecture headers for eBPF networking structs
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86 -I/usr/include/$(shell uname -m)-linux-gnu
 
 # Libraries
 SSL_LIBS = -lssl -lcrypto -lpthread
