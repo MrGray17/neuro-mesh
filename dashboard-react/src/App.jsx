@@ -27,9 +27,10 @@ function App() {
     const activeNodes = data.active_nodes || [];
     const logs = data.logs || [];
     
+    // 🛡️ THE FIX: Accurate node calculation ensuring no phantom stable nodes
     const agentCount = activeNodes.length;
     const compCount = activeNodes.filter(n => n.status === 'COMPROMIS' || n.status === 'DISCONNECTED_ALERT' || n.status === 'SELF_ISOLATED').length;
-    const stableCount = agentCount === 0 ? 1 : agentCount - compCount; 
+    const stableCount = agentCount === 0 ? 0 : agentCount - compCount; 
     
     const totalRam = activeNodes.reduce((acc, curr) => acc + (curr.ram_mb || 0), 0);
     const avgRam = agentCount > 0 ? Math.round(totalRam / agentCount) : 0;

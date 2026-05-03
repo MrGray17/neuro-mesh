@@ -15,22 +15,31 @@ async def register_client(websocket):
 
 class TelemetryReceiver(asyncio.DatagramProtocol):
     """Listens for high-speed UDP packets from the C++ agent."""
+    def __init__(self):
+        # 🔥 THE FIX: Prevent OutOfMemory by tracking background asyncio tasks.
+        self.active_tasks = set() 
+
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
         message = data.decode('utf-8')
-        # If we have connected UI clients, push the telemetry to them
         if connected_clients:
-            asyncio.create_task(self.broadcast(message))
+            task = asyncio.create_task(self.broadcast(message))
+            self.active_tasks.add(task)
+            # Self-cleaning callback ensures task is evicted the moment it finishes.
+            task.add_done_callback(self.active_tasks.discard)
 
     async def broadcast(self, message):
-        """Fan-out the JSON log to all WebSockets."""
-        # websockets.broadcast is optimized for concurrent fan-out
-        websockets.broadcast(connected_clients, message)
+        """Fan-out the JSON log to all WebSockets safely."""
+        try:
+            websockets.broadcast(connected_clients, message)
+        except Exception:
+            # Drop silently to prevent unhandled exceptions breaking the loop
+            pass
 
 async def main():
-    print("🚀 Neuro-Mesh Bridge API Online.")
+    print("🚀 Neuro-Mesh Bridge API Online (Memory-Safe Edition).")
     
     # 1. Start WebSocket server for React (Port 8080)
     async with websockets.serve(register_client, "localhost", 8080):
@@ -44,7 +53,6 @@ async def main():
         )
         print("🔌 Internal UDP Listener bound to 127.0.0.1:50052")
         
-        # Keep the event loop alive forever
         await asyncio.Future()
 
 if __name__ == "__main__":

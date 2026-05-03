@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 
-export const useWebSocket = (wsUrl = 'ws://localhost:8081', httpUrl = 'http://localhost:8000/api.json') => {
+export const useWebSocket = (wsUrl = 'ws://localhost:8080', httpUrl = 'http://localhost:5000/api.json') => {
     const [data, setData] = useState({ active_nodes: [], logs: [], system_status: 'AWAITING' });
     const [connectionState, setConnectionState] = useState('SEARCHING_P2P');
     const pollRef = useRef(null);

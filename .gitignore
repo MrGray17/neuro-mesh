@@ -18,3 +18,7 @@ node_modules/
 # OS/IDEs
 .DS_Store
 .vscode/
+neuro_mesh_full_*.txt
+neuro_mesh_pure_code*
+*.log
+ia_commands.txt

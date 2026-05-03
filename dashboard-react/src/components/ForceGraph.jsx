@@ -20,7 +20,7 @@ const ForceGraph = ({ nodes, edges }) => {
         stabilization: false, 
         solver: 'forceAtlas2Based',
         forceAtlas2Based: {
-          centralGravity: 0.05, // 🔥 LE FIX: Maintient les nœuds isolés au centre
+          centralGravity: 0.05, 
           springLength: 100,
           springConstant: 0.08,
           gravitationalConstant: -50
@@ -33,6 +33,15 @@ const ForceGraph = ({ nodes, edges }) => {
     } else {
       networkRef.current = new Network(containerRef.current, data, options);
     }
+
+    // 🛡️ THE FIX: Memory leak closure. Prevents detached DOM elements 
+    // from consuming browser heap during React StrictMode renders.
+    return () => {
+        if (networkRef.current) {
+            networkRef.current.destroy();
+            networkRef.current = null;
+        }
+    };
   }, [nodes, edges]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '170px', background: '#00000066', borderRadius: '4px' }} />;

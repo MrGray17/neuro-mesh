@@ -1,5 +1,5 @@
 // ============================================================
-// NEURO-MESH C2 : STAFF ENGINEER EDITION (RESILIENCE & IA SYNC)
+// NEURO-MESH C2 : STAFF ENGINEER EDITION (ATOMIC I/O & RESILIENCE)
 // ============================================================
 #include <iostream>
 #include <sys/socket.h>
@@ -51,7 +51,6 @@ void export_to_json();
 #define RECV_BUFFER_SIZE    65536
 #define RSA_ENCRYPTED_LEN   256
 #define MAX_LOG_ENTRIES     1000
-#define JSON_TMP_FILE       "api_tmp.json"
 #define JSON_FILE           "api.json"
 #define WS_PORT             8081
 #define MAX_C2_CONNECTIONS  500
@@ -97,9 +96,6 @@ struct ConnectionGuard {
     ~ConnectionGuard() { if (counter > 0) counter--; }
 };
 
-// ============================================================
-// INFRASTRUCTURE: SECRETS MANAGEMENT (Fail Fast Pattern)
-// ============================================================
 std::string get_c2_auth_token() {
     const char* env_token = std::getenv("NEURO_MESH_SECRET");
     if (!env_token || std::strlen(env_token) == 0) {
@@ -236,7 +232,7 @@ void log_event_safe(const std::string& message) {
 }
 
 // ============================================================
-// DATA EXPORT (Lock-Free I/O Optimization)
+// DATA EXPORT (Lock-Free I/O Optimization & Atomic Renames)
 // ============================================================
 void export_to_json() {
     static auto last_export = std::chrono::steady_clock::now() - std::chrono::milliseconds(1000);
@@ -244,7 +240,6 @@ void export_to_json() {
     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_export).count() < 100) return;
     last_export = now;
 
-    // 1. Parse external AI commands
     std::ifstream cmd_file("ia_commands.txt");
     if (cmd_file.is_open()) {
         std::string line;
@@ -262,7 +257,6 @@ void export_to_json() {
         cmd_file.close();
     }
 
-    // 2. Snapshot data quickly to minimize lock contention
     std::vector<AgentNode> snapshot_nodes;
     std::vector<AgentNode> snapshot_alerts;
     std::vector<std::string> snapshot_logs;
@@ -279,7 +273,6 @@ void export_to_json() {
         for (size_t i = start; i < security_logs.size(); ++i) snapshot_logs.push_back(security_logs[i]);
     }
 
-    // 3. Serialize and Write to disk outside the locks
     json j;
     j["architecture"] = "NEURO-MESH (Sovereign Distributed C2)";
     j["system_status"] = "ONLINE";
@@ -310,12 +303,18 @@ void export_to_json() {
 
     std::string dump_content = j.dump();
 
-    std::ofstream file(JSON_TMP_FILE);
+    // 🛡️ THE FIX: Thread-unique temporary files + Atomic rename to prevent TOCTOU tears
+    std::ostringstream tmp_filename;
+    tmp_filename << "api_tmp_" << std::this_thread::get_id() << ".json";
+    std::string unique_tmp_file = tmp_filename.str();
+
+    std::ofstream file(unique_tmp_file);
     if (file.is_open()) { 
         file << dump_content; 
         file.close(); 
-        std::rename(JSON_TMP_FILE, JSON_FILE); 
+        std::rename(unique_tmp_file.c_str(), JSON_FILE); 
     }
+    
     broadcast_websocket(dump_content);
 }
 
@@ -432,7 +431,6 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
 
     this_node.status = "STABLE"; this_node.latency = 5000;
 
-    // FIX: Verify the actual token contents
     uint32_t auth_len;
     if (recv_full(client_socket, (char*)&auth_len, 4) == 4) {
         auth_len = ntohl(auth_len);

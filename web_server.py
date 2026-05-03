@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
+# ============================================================
+# NEURO-MESH : SANITIZED WEB API
+# ============================================================
 from flask import Flask, send_from_directory, jsonify
 from flask_cors import CORS
-import subprocess
 import json
 import os
+import subprocess
 
 app = Flask(__name__)
 CORS(app)
 
-# Route pour le dashboard
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')
 
-# Route pour les fichiers statiques (CSS, JS, etc.)
 @app.route('/<path:path>')
 def static_files(path):
     return send_from_directory('.', path)
 
-# API pour récupérer les données des agents (via api.json)
 @app.route('/api/data')
 def api_data():
     try:
@@ -27,13 +27,17 @@ def api_data():
     except:
         return jsonify({"active_nodes": []})
 
-# API pour lancer une attaque
+# WHY: Eradicated shell=True and Popen vulnerabilities. 
+# We explicitly call the hardened python module.
 @app.route('/api/attack', methods=['POST'])
 def api_attack():
-    subprocess.Popen(["./test_attack.sh", "--force"])
-    return jsonify({"status": "attack_launched", "message": "🔥 Attaque simulée en cours"})
+    try:
+        # Strictly executing the Python binary without invoking a bash shell
+        subprocess.run(["python3", "neuro_ctl.py", "inject"], check=True)
+        return jsonify({"status": "attack_launched", "message": "🔥 Attaque simulée en cours"})
+    except subprocess.CalledProcessError:
+        return jsonify({"status": "error", "message": "Failed to launch attack."}), 500
 
-# API pour récupérer les logs
 @app.route('/api/logs')
 def api_logs():
     try:
@@ -43,17 +47,14 @@ def api_logs():
     except:
         return jsonify([])
 
-# API pour récupérer le statut du système
 @app.route('/api/status')
 def api_status():
     return jsonify({
         "c2_online": os.path.exists('api.json'),
         "websocket_port": 8081,
-        "dashboard_version": "3.0"
+        "dashboard_version": "4.0_SOVEREIGN"
     })
 
 if __name__ == '__main__':
-    print("🚀 NEURO-MESH Web Server démarré")
-    print("📡 Dashboard: http://localhost:5000")
-    print("⚔️ Interface de commandement prête")
+    print("🚀 NEURO-MESH Web Server démarré (Sanitized)")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

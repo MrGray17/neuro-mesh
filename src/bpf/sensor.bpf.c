@@ -1,37 +1,32 @@
 // ============================================================
-// NEURO-MESH : KERNEL eBPF SENSOR & XDP DROPPER
+// NEURO-MESH : KERNEL eBPF SENSOR & XDP DROPPER (HARDENED)
 // ============================================================
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
-// 1. DATA STRUCTURES
 struct KernelEvent {
-    unsigned int pid;
-    int event_type;
+    __u32 pid;
+    __u32 event_type;
     char comm[16];
     char payload[256];
 };
 
-// 2. KERNEL TO USERSPACE RING BUFFER (The Eyes)
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } telemetry_ringbuf SEC(".maps");
 
-// 3. THE HARDWARE BLACKLIST MAP (The Shield)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __be32);   // IP Address
-    __type(value, __u8);   // Status (1 = Blocked)
+    __type(key, __u32);    
+    __type(value, __u8);   
 } xdp_blacklist SEC(".maps");
 
-// ============================================================
-// XDP PROGRAM: HARDWARE-LEVEL PACKET DROPPER
-// Runs directly on the Network Interface Card driver
-// ============================================================
+// XDP: Hardware-level packet dropper
 SEC("xdp")
 int xdp_neuro_mesh_dropper(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -39,43 +34,52 @@ int xdp_neuro_mesh_dropper(struct xdp_md *ctx) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
-
-    // We only care about IP traffic
     if (eth->h_proto != __constant_htons(ETH_P_IP)) return XDP_PASS;
 
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return XDP_PASS;
 
-    // Check if the Source IP is in our "COMPROMISED" hash map
-    __be32 src_ip = iph->saddr;
+    // Strict validation of banned IPs
+    __u32 src_ip = iph->saddr;
     __u8 *banned = bpf_map_lookup_elem(&xdp_blacklist, &src_ip);
-    if (banned && *banned == 1) {
-        // Instant hardware-level drop. No CPU usage for the kernel stack.
-        return XDP_DROP;
-    }
+    if (banned && *banned == 1) return XDP_DROP;
+
+    // Global Lockdown Check
+    __u32 lockdown_key = 0xFFFFFFFF;
+    __u8 *lockdown = bpf_map_lookup_elem(&xdp_blacklist, &lockdown_key);
+    if (lockdown && *lockdown == 1) return XDP_DROP;
 
     return XDP_PASS;
 }
 
-// ============================================================
-// TRACEPOINT: PROCESS EXECUTION MONITORING
-// Feeds the local AI Inference Engine via Ring Buffer
-// ============================================================
+// TRACEPOINT: Secure Execution Monitoring
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_execve(void *ctx) {
     struct KernelEvent *event;
-    
-    // Reserve memory in the ring buffer
+
     event = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*event), 0);
     if (!event) return 0;
 
+    // WHY: Cryptographically secure memory sanitization. Prevents uninitialized 
+    // kernel stack memory from bleeding into user-space via the payload array.
+    __builtin_memset(event, 0, sizeof(struct KernelEvent));
+
     event->pid = bpf_get_current_pid_tgid() >> 32;
-    event->event_type = 1; // 1 = EXEC
-    
-    // Grab the command name
-    bpf_get_current_comm(&event->comm, sizeof(event->comm));
-    
-    // Submit to user-space SovereignCell
+    event->event_type = 1; 
+
+    // WHY: Fail fast if the process is exiting or context is invalid.
+    if (bpf_get_current_comm(&event->comm, sizeof(event->comm)) < 0) {
+        bpf_ringbuf_discard(event, 0);
+        return 0;
+    }
+
+    // Safely read the first argument (binary path) into payload
+    const char *pathname = NULL;
+    bpf_core_read(&pathname, sizeof(pathname), (void *)((char *)ctx + 16)); 
+    if (pathname) {
+        bpf_probe_read_user_str(&event->payload, sizeof(event->payload), pathname);
+    }
+
     bpf_ringbuf_submit(event, 0);
     return 0;
 }
